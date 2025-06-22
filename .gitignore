@@ -179,3 +179,8 @@ results/
 
 .vscode/
 .python-version
+
+*.png
+*.jpg
+*.jpeg
+*.json
