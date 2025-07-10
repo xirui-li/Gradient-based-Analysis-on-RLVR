@@ -465,6 +465,7 @@ class GRPOTrainer(Trainer):
         # Models
         # Trained model
         model_init_kwargs = args.model_init_kwargs or {}
+        self.model_name_or_path = model.config._name_or_path
         if isinstance(model, str):
             model_id = model
             torch_dtype = model_init_kwargs.get("torch_dtype")
@@ -1631,9 +1632,10 @@ class GRPOTrainer(Trainer):
 
     def _collect_gradient_stats_by_layers(self, gradients, mode):
         """
-        Collect gradient statistics with SVD analysis for individual parameters.
-        Offloads SVD to CPU via NumPy for memory efficiency.
-        Works per-rank for ZeRO-3 partial gradients.
+        Collect gradient statistics and optionally compute SVD-derived metrics
+        (nuclear norm and effective rank) for top-k layers based on average Frobenius norm.
+
+        Runs SVD only every 50 steps after determining top-k layers during early training.
         """
         print(f"Debug: Starting gradient stats collection on rank {self.accelerator.process_index} in {mode} mode")
 
@@ -1643,8 +1645,14 @@ class GRPOTrainer(Trainer):
             print(f"Debug: No gradients found on rank {self.accelerator.process_index}. This is expected under ZeRO-3.")
             return
 
-        # Per-step stats dictionary for saving to file
         step_grad_stats = {}
+
+        # Initialize stateful containers
+        if not hasattr(self, "_running_layer_norms"):
+            from collections import defaultdict
+            self._running_layer_norms = defaultdict(list)
+            self._topk_svd_layers = None
+            self._svd_top_k = 5  # You can make this a config arg
 
         for name, grad in grad_items:
             if grad is None:
@@ -1656,49 +1664,72 @@ class GRPOTrainer(Trainer):
             M_min = grad.min().item()
             frobenius_norm = torch.linalg.norm(grad).item()
 
-            # Metric key prefix
             param_prefix = f"grad_stats/params/{name}"
 
-            # Store to in-memory metrics
+            # Save to memory
             self._metrics[mode][f"{param_prefix}/M_mean"].append(M_mean)
             self._metrics[mode][f"{param_prefix}/M_max"].append(M_max)
             self._metrics[mode][f"{param_prefix}/M_min"].append(M_min)
             self._metrics[mode][f"{param_prefix}/frobenius_norm"].append(frobenius_norm)
 
-            # Store to JSONL dict
+            # Save to file
             step_grad_stats[f"{param_prefix}/M_mean"] = M_mean
             step_grad_stats[f"{param_prefix}/M_max"] = M_max
             step_grad_stats[f"{param_prefix}/M_min"] = M_min
             step_grad_stats[f"{param_prefix}/frobenius_norm"] = frobenius_norm
 
-            # # Perform SVD on CPU if grad is a matrix
-            # if len(grad.shape) > 1:
-            #     try:
-            #         grad_np = grad.detach().cpu().numpy()
-            #         _, S, _ = np.linalg.svd(grad_np, full_matrices=False)
+            # Track norm for first 50 steps
+            if self.state.global_step < 50 and grad.ndim >= 2:
+                self._running_layer_norms[name].append(frobenius_norm)
 
-            #         S_sum = float(S.sum())
-            #         S_max = float(S.max())
-            #         S_min = float(S.min())
+        # Select top-k layers at step 49
+        if self.state.global_step == 49:
+            avg_norms = {name: sum(vals) / len(vals) for name, vals in self._running_layer_norms.items()}
+            sorted_layers = sorted(avg_norms.items(), key=lambda x: x[1], reverse=True)
+            self._topk_svd_layers = {name for name, _ in sorted_layers[:self._svd_top_k]}
+            print(f"[Info] Top-{self._svd_top_k} layers selected for SVD:", self._topk_svd_layers)
 
-            #         # In-memory
-            #         self._metrics[mode][f"{param_prefix}/S_sum"].append(S_sum)
-            #         self._metrics[mode][f"{param_prefix}/S_max"].append(S_max)
-            #         self._metrics[mode][f"{param_prefix}/S_min"].append(S_min)
+        # Compute SVD on selected layers every 50 steps
+        if self._topk_svd_layers and self.state.global_step % 50 == 0:
+            for name, grad in grad_items:
+                if name not in self._topk_svd_layers or grad.ndim < 2:
+                    continue
 
-            #         # JSONL
-            #         step_grad_stats[f"{param_prefix}/S_sum"] = S_sum
-            #         step_grad_stats[f"{param_prefix}/S_max"] = S_max
-            #         step_grad_stats[f"{param_prefix}/S_min"] = S_min
+                try:
+                    # GPU SVD for speed
+                    S = torch.linalg.svd(grad.detach(), full_matrices=False).S
+                    S_sum = S.sum().item()
+                    p = S / S_sum
+                    effective_rank = torch.exp(-torch.sum(p * torch.log(p + 1e-12))).item()
 
-            #     except np.linalg.LinAlgError:
-            #         print(f"[Warning] NumPy SVD failed for param: {name}")
-            #         for stat in ["S_sum", "S_max", "S_min"]:
-            #             self._metrics[mode][f"{param_prefix}/{stat}"].append(None)
-            #             step_grad_stats[f"{param_prefix}/{stat}"] = None
+                    nuclear_norm = S_sum
+                    S_max = S.max().item()
+                    S_min = S.min().item()
 
-        # Save to JSONL
+                    # Save to memory
+                    param_prefix = f"grad_stats/params/{name}"
+                    self._metrics[mode][f"{param_prefix}/S_sum"].append(S_sum)
+                    self._metrics[mode][f"{param_prefix}/S_max"].append(S_max)
+                    self._metrics[mode][f"{param_prefix}/S_min"].append(S_min)
+                    self._metrics[mode][f"{param_prefix}/nuclear_norm"].append(nuclear_norm)
+                    self._metrics[mode][f"{param_prefix}/effective_rank"].append(effective_rank)
+
+                    # Save to JSONL
+                    step_grad_stats[f"{param_prefix}/S_sum"] = S_sum
+                    step_grad_stats[f"{param_prefix}/S_max"] = S_max
+                    step_grad_stats[f"{param_prefix}/S_min"] = S_min
+                    step_grad_stats[f"{param_prefix}/nuclear_norm"] = nuclear_norm
+                    step_grad_stats[f"{param_prefix}/effective_rank"] = effective_rank
+
+                except Exception as e:
+                    print(f"[Warning] SVD failed for {name} at step {self.state.global_step}: {e}")
+                    for stat in ["S_sum", "S_max", "S_min", "nuclear_norm", "effective_rank"]:
+                        self._metrics[mode][f"{param_prefix}/{stat}"].append(None)
+                        step_grad_stats[f"{param_prefix}/{stat}"] = None
+
+        # Save stats to file
         self._save_grad_stats_to_file(step_grad_stats, step=self.state.global_step)
+
 
     def _extract_global_gradients(self, accelerator, model):
         """
@@ -1740,7 +1771,7 @@ class GRPOTrainer(Trainer):
             json.dump(data, f, indent=2)
     
 
-    def _save_grad_stats_to_file(self, data: dict, step: int, save_dir: str = "grad_stats_history_no_thinking"):
+    def _save_grad_stats_to_file(self, data: dict, step: int):
         """
         Save gradient stats for one step as a separate JSON file in a folder.
 
@@ -1749,6 +1780,7 @@ class GRPOTrainer(Trainer):
             step (int): The current training step.
             save_dir (str): Directory where individual JSON files are stored.
         """
+        save_dir = "grad_stats_history_grpo_" + self.model_name_or_path
         os.makedirs(save_dir, exist_ok=True)
         filepath = os.path.join(save_dir, f"step_{step:06d}.json")
 

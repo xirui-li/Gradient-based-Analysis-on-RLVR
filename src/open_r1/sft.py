@@ -47,6 +47,7 @@ from open_r1.utils import get_dataset, get_model, get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import ModelConfig, SFTTrainer, TrlParser, get_peft_config, setup_chat_format
+from open_r1.trainer import CustomSFTTrainer
 
 
 logger = logging.getLogger(__name__)
@@ -95,18 +96,42 @@ def main(script_args, training_args, model_args):
         logger.info("No chat template provided, defaulting to ChatML.")
         model, tokenizer = setup_chat_format(model, tokenizer, format="chatml")
 
+    #     # Format into conversation
+    # def make_conversation(example):
+    #     prompt = []
+
+    #     # if training_args.system_prompt is not None:
+    #         # prompt.append({"role": "system", "content": training_args.system_prompt})
+    #     prompt.append({"role": "user", "content": example["problem"]})
+    #     return {"prompt": prompt, "completion": "The answer is " + example["answer"] + "."}
+
+    # dataset = dataset.map(make_conversation)
+
     ############################
     # Initialize the SFT Trainer
     ############################
-    trainer = SFTTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=(dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None),
-        processing_class=tokenizer,
-        peft_config=get_peft_config(model_args),
-        callbacks=get_callbacks(training_args, model_args),
-    )
+    cumstomized = True
+    if not cumstomized:
+        trainer = SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=dataset[script_args.dataset_train_split],
+            eval_dataset=(dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None),
+            processing_class=tokenizer,
+            peft_config=get_peft_config(model_args),
+            callbacks=get_callbacks(training_args, model_args),
+        )
+    else:
+        trainer = CustomSFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=dataset[script_args.dataset_train_split],
+            eval_dataset=(dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None),
+            processing_class=tokenizer,
+            peft_config=get_peft_config(model_args),
+            callbacks=get_callbacks(training_args, model_args),
+        )
+
 
     ###############
     # Training loop
