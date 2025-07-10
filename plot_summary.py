@@ -183,8 +183,8 @@ def create_grouped_distribution_plots(data_dict, output_dir='plots_grouped/distr
             plt.close()
 
 def main():
-    patterns = ["thinking", "no_thinking"]
-    folder_paths = ["./grad_stats_history", "./grad_stats_history_no_thinking"]
+    patterns = ["rl", "sft"]
+    folder_paths = ["./grad_stats_history", "./grad_stats_history_sft"]
     
     data_dict = {}
     
@@ -195,10 +195,10 @@ def main():
         data_dict[pattern] = organized_data
 
     print("Creating grouped summary plots...")
-    create_grouped_summary_plots(data_dict, output_dir='plots_grouped/summary')
+    create_grouped_summary_plots(data_dict, output_dir='plots_e1/summary')
 
     print("Creating grouped distribution plots...")
-    create_grouped_distribution_plots(data_dict, output_dir='plots_grouped/distribution')
+    create_grouped_distribution_plots(data_dict, output_dir='plots_e1/distribution')
 
     print("Done. Check plots_grouped/ for results.")
 
