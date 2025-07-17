@@ -339,8 +339,8 @@ class GRPOTrainerWithShapely(GRPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Additional initialization for Shapely can be added here if needed
-        self.reward_func_names_evaluation = ["accuracy_reward"]
-        self.reward_processing_classes_evaluation = [None] * self.reward_func_names_evaluation 
+        self.reward_func_names_evaluation = ["accuracy_reward"] # <-- hard coded for now, can be changed later
+        self.reward_processing_classes_evaluation = [None] * len(self.reward_func_names_evaluation)
         if self.reward_funcs is not None:
             self.reward_funcs_evaluation = [
                 func for name, func in zip(self.reward_func_names, self.reward_funcs)
@@ -549,8 +549,6 @@ class GRPOTrainerWithShapely(GRPOTrainer):
         if eval_dataloader is not None:
             eval_iterator = iter(eval_dataloader)
             eval_batch = next(eval_iterator)
-            # Use the same method as training inputs to move to device
-            eval_batch = self._prepare_inputs(eval_batch)
 
         # Setup training parameters (similar to original)
         total_train_batch_size = self._train_batch_size * args.gradient_accumulation_steps * args.world_size
@@ -779,7 +777,6 @@ class GRPOTrainerWithShapely(GRPOTrainer):
                         and self.accelerator.distributed_type != DistributedType.DEEPSPEED
                         else contextlib.nullcontext
                     )
-                    
                     with context():
                         # Use our modified training step that computes Shapley values
                         tr_loss_step = self.training_step_with_shapley(model, inputs, eval_batch, num_items_in_batch)
@@ -1015,7 +1012,7 @@ class GRPOTrainerWithShapely(GRPOTrainer):
             )
 
         # Compute Shapley value as dot product of gradients
-        self.compute_shapley_from_gradients(train_gradients, eval_gradients)
+        self.compute_shapley_from_gradients(train_gradients, eval_gradients, model)
 
         # Now perform the actual backward pass for training (following original training_step logic)
         if self.use_apex:
@@ -1038,23 +1035,25 @@ class GRPOTrainerWithShapely(GRPOTrainer):
         return train_loss.detach()
 
     def compute_shapley_from_gradients(self,
-                                        train_gradients_named: Dict[str, torch.Tensor],
-                                        eval_gradients_named: Dict[str, torch.Tensor],
-                                        mode: str = "shapley") -> None:
+                                    train_gradients_tuple,
+                                    eval_gradients_tuple,
+                                    model,
+                                    mode: str = "train") -> None:
         """
         Compute and log per-layer Shapley values as dot products between train and eval gradients.
 
         Args:
-            train_gradients_named: Dict mapping parameter names to training gradients
-            eval_gradients_named: Dict mapping parameter names to evaluation gradients
+            train_gradients_tuple: Tuple of training gradients from torch.autograd.grad()
+            eval_gradients_tuple: Tuple of evaluation gradients from torch.autograd.grad()
+            model: The model to get parameter names from
             mode: Logging namespace (e.g., "shapley") for tracking
         """
         print(f"Debug: Starting Shapley dot product computation on rank {self.accelerator.process_index} in {mode} mode")
 
         step_shapley_stats = {}
 
-        for name, train_grad in train_gradients_named.items():
-            eval_grad = eval_gradients_named.get(name)
+        # Convert gradient tuples to named dictionaries and compute dot products
+        for (name, param), train_grad, eval_grad in zip(model.named_parameters(), train_gradients_tuple, eval_gradients_tuple):
             if train_grad is None or eval_grad is None:
                 continue
 
@@ -1088,7 +1087,6 @@ class GRPOTrainerWithShapely(GRPOTrainer):
         #   - The input is treated as a standard local batch (no accumulation, no multiple iterations)
         #   - Completions are generated for each batch without buffering or reuse
         # Returns a single local batch in both cases.
-
         mode = "train" if self.model.training else "eval"
         if mode == "train":
             generate_every = self.args.steps_per_generation * self.num_iterations
@@ -1110,13 +1108,12 @@ class GRPOTrainerWithShapely(GRPOTrainer):
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
-
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
         prompt_inputs = self.processing_class(
             text=prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        prompt_inputs = super(GRPOTrainer, self)._prepare_inputs(prompt_inputs) # <- call grand parent method to handle any additional processing
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
         if self.max_prompt_length is not None:
