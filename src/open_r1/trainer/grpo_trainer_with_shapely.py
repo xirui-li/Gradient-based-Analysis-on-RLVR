@@ -840,17 +840,18 @@ class GRPOTrainerWithShapely(GRPOTrainer):
                         self.state.global_step += 1
                         self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                         self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-                        
-                        self._maybe_log_save_evaluate(
-                            tr_loss,
-                            grad_norm,
-                            model,
-                            trial,
-                            epoch,
-                            ignore_keys_for_eval,
-                            start_time,
-                            learning_rate=learning_rate,
-                        )
+
+                        # # Uncomment if you want to log/save/evaluate at the end of each step
+                        # self._maybe_log_save_evaluate(
+                        #     tr_loss,
+                        #     grad_norm,
+                        #     model,
+                        #     trial,
+                        #     epoch,
+                        #     ignore_keys_for_eval,
+                        #     start_time,
+                        #     learning_rate=learning_rate,
+                        # )
                     else:
                         self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
@@ -872,9 +873,10 @@ class GRPOTrainerWithShapely(GRPOTrainer):
                 self.control.should_training_stop = True
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-            self._maybe_log_save_evaluate(
-                tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=learning_rate
-            )
+            # # Uncomment if you want to log/save/evaluate at the end of each epoch
+            # self._maybe_log_save_evaluate(
+            #     tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=learning_rate
+            # )
 
             if self.control.should_training_stop:
                 break
