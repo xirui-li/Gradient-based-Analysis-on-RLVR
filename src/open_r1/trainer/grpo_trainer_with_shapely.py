@@ -1033,6 +1033,9 @@ class GRPOTrainerWithShapely(GRPOTrainer):
             gradients = self._extract_global_gradients(self.accelerator, self.model)
             mode = "train" if self.model.training else "eval"
             self._collect_gradient_stats_by_layers(gradients, mode)
+            self._save_all_metrics_snapshot(
+                    mode=mode
+                )
 
         return train_loss.detach()
 
@@ -1069,9 +1072,6 @@ class GRPOTrainerWithShapely(GRPOTrainer):
                 param_prefix = f"shapley_stats/params/{name}"
                 self._metrics[mode][f"{param_prefix}/dot_product"].append(dot)
                 step_shapley_stats[f"{param_prefix}/dot_product"] = dot
-
-        # Save to file or external logger
-        self._save_grad_stats_to_file(step_shapley_stats, step=self.state.global_step)
 
     @profiling_decorator
     def _prepare_inputs(

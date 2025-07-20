@@ -150,7 +150,6 @@ def main(script_args, training_args, model_args):
         train_result = trainer.train_with_shapley(resume_from_checkpoint=checkpoint)
     else:
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-    import pdb; pdb.set_trace()
     metrics = train_result.metrics
     metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
     trainer.log_metrics("train", metrics)

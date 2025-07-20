@@ -464,6 +464,7 @@ class GRPOTrainer(Trainer):
 
         # Models
         # Trained model
+        self.run_name = args.output_dir
         model_init_kwargs = args.model_init_kwargs or {}
         self.model_name_or_path = model.config._name_or_path
         if isinstance(model, str):
@@ -1627,6 +1628,11 @@ class GRPOTrainer(Trainer):
             gradients = self._extract_global_gradients(self.accelerator, self.model)
             mode = "train" if self.model.training else "eval"
             self._collect_gradient_stats_by_layers(gradients, mode)
+            self._save_all_metrics_snapshot(
+                    step=self.state.global_step,
+                    mode=mode
+                )
+
 
             return loss.detach()
 
@@ -1727,9 +1733,6 @@ class GRPOTrainer(Trainer):
                         self._metrics[mode][f"{param_prefix}/{stat}"].append(None)
                         step_grad_stats[f"{param_prefix}/{stat}"] = None
 
-        # Save stats to file
-        self._save_grad_stats_to_file(step_grad_stats, step=self.state.global_step)
-
 
     def _extract_global_gradients(self, accelerator, model):
         """
@@ -1759,33 +1762,24 @@ class GRPOTrainer(Trainer):
         else:
             return self._safe_convert(d)
 
-    def _append_grad_stats_to_json(self, grad_stats: dict, filepath: str):
-        grad_stats_serializable = self._recursive_convert(grad_stats)
-        if os.path.exists(filepath):
-            with open(filepath, "r") as f:
-                data = json.load(f)
-        else:
-            data = []
-        data.append(grad_stats_serializable)
-        with open(filepath, "w") as f:
-            json.dump(data, f, indent=2)
-    
-
-    def _save_grad_stats_to_file(self, data: dict, step: int):
+    def _save_all_metrics_snapshot(self, mode: str):
         """
-        Save gradient stats for one step as a separate JSON file in a folder.
-
-        Args:
-            data (dict): Gradient stats for this step.
-            step (int): The current training step.
-            save_dir (str): Directory where individual JSON files are stored.
+        Save full accumulated metrics into a single JSON file, overwriting each time.
         """
-        save_dir = "grad_stats_history_grpo_" + self.model_name_or_path
+        save_dir = f"stats/{self.run_name}"
         os.makedirs(save_dir, exist_ok=True)
-        filepath = os.path.join(save_dir, f"step_{step:06d}.json")
+        filepath = os.path.join(save_dir, f"{mode}_metrics.json")  # only one file per mode
+
+        snapshot = {
+            "mode": mode,
+            "metrics": self._recursive_convert(self._metrics.get(mode, {}))
+        }
 
         with open(filepath, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(snapshot, f, indent=2)
+
+
+
 
 
 
