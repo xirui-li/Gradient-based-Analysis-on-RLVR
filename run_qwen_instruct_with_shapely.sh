@@ -24,6 +24,6 @@ export CUDA_VISIBLE_DEVICES=5,6
 
 # Launch training
 ACCELERATE_LOG_LEVEL=info \
-accelerate launch --config_file recipes/accelerate_configs/zero3.yaml \
+accelerate launch --config_file recipes/accelerate_configs/zero3_debug.yaml \
     src/open_r1/grpo.py --config recipes/Qwen2.5-1.5B-Instruct/grpo/config_shapley_math12k.yaml \
     --vllm_mode colocate

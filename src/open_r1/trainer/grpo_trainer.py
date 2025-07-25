@@ -29,6 +29,7 @@ import json
 import datasets
 import torch
 import torch.utils.data
+import torch.distributed as dist
 import transformers
 from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
 from datasets import Dataset, IterableDataset
@@ -1764,19 +1765,61 @@ class GRPOTrainer(Trainer):
 
     def _save_all_metrics_snapshot(self, mode: str):
         """
-        Save full accumulated metrics into a single JSON file, overwriting each time.
+        Gather per-rank metrics at the current step and save one JSON line per rank to a JSONL file from rank 0.
+
+        Each line structure:
+        {
+            "mode": "train",
+            "step": 100,
+            "rank": 0,
+            "metrics": {...}
+        }
         """
+
         save_dir = f"stats/{self.run_name}"
         os.makedirs(save_dir, exist_ok=True)
-        filepath = os.path.join(save_dir, f"{mode}_metrics.json")  # only one file per mode
+        filepath = os.path.join(save_dir, f"{mode}_metrics.jsonl")
 
-        snapshot = {
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        step = self.state.global_step
+        local_entry = {
             "mode": mode,
-            "metrics": self._recursive_convert(self._metrics.get(mode, {}))
+            "step": step,
+            "rank": rank,
+            "metrics": self._recursive_convert(self._metrics.get(mode, {})),
         }
 
-        with open(filepath, "w") as f:
-            json.dump(snapshot, f, indent=2)
+        # Serialize and convert to bytes
+        local_json = json.dumps(local_entry)
+        local_bytes = torch.tensor(list(local_json.encode("utf-8")), dtype=torch.uint8, device="cuda")
+
+        # Share sizes
+        local_size = torch.tensor([local_bytes.numel()], dtype=torch.int64, device="cuda")
+        all_sizes = [torch.zeros(1, dtype=torch.int64, device="cuda") for _ in range(world_size)]
+        dist.all_gather(all_sizes, local_size)
+
+        max_size = max(size.item() for size in all_sizes)
+        padded = torch.zeros(max_size, dtype=torch.uint8, device="cuda")
+        padded[:local_bytes.numel()] = local_bytes
+
+        gathered = [torch.zeros(max_size, dtype=torch.uint8, device="cuda") for _ in range(world_size)]
+        dist.all_gather(gathered, padded)
+
+        # Append to file (rank 0 only)
+        if rank == 0:
+            with open(filepath, "a") as f:
+                for tensor, size in zip(gathered, all_sizes):
+                    try:
+                        raw_bytes = tensor[:size.item()].cpu().numpy().tobytes()
+                        line = raw_bytes.decode("utf-8")
+                        f.write(line + "\n")
+                    except Exception as e:
+                        print(f"[Rank 0] Failed to write metrics: {e}")
+
+
+
 
 
 
