@@ -355,6 +355,26 @@ class GRPOTrainerWithShapely(GRPOTrainer):
         
         self._eval_batch_size = self.args.eval_batch_size
 
+        # ---- Shapley logging policy (minimal) ---------------------------------
+        self._shapley_log_every = 1  # log cadence
+        # Collect all trainable param names once
+        _all_param_names = [n for n, p in self.model.named_parameters() if p.requires_grad]
+
+        # Sample exactly once, deterministically from seed; make it identical on all ranks
+        rng = np.random.default_rng(getattr(self.args, "seed", 0) or 0)
+
+        if self.accelerator.is_main_process:
+            k = min(512, len(_all_param_names))
+            sampled = rng.choice(_all_param_names, size=k, replace=False).tolist()
+        else:
+            sampled = None
+
+        # Broadcast the sampled set to all processes so everyone filters by the same names
+        sampled = broadcast_object_list([sampled], from_process=0)[0]
+        self._shapley_param_sample = set(sampled)
+        # -----------------------------------------------------------------------
+
+
 
     def get_eval_dataloader(self, eval_dataset=None) -> DataLoader:
         """
@@ -1053,13 +1073,22 @@ class GRPOTrainerWithShapely(GRPOTrainer):
             model: The model to get parameter names from
             mode: Logging namespace (e.g., "shapley") for tracking
         """
-        print(f"Debug: Starting Shapley dot product computation on rank {self.accelerator.process_index} in {mode} mode")
+        # --- rank-0 only logging ---
+        if not self.accelerator.is_main_process:
+            return
+
+        # --- throttle by global step ---
+        step = int(getattr(self.state, "global_step", 0))
+        if step % getattr(self, "_shapley_log_every", 500) != 0:
+            return
 
         step_shapley_stats = {}
 
         # Convert gradient tuples to named dictionaries and compute dot products
         for (name, param), train_grad, eval_grad in zip(model.named_parameters(), train_gradients_tuple, eval_gradients_tuple):
             if train_grad is None or eval_grad is None:
+                continue
+            if name not in self._shapley_param_sample:
                 continue
 
             try:
