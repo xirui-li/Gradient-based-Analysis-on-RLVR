@@ -37,49 +37,202 @@ from .utils.competitive_programming import score_submission as cf_score_submissi
 from .utils.competitive_programming import score_subtask
 
 
-def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[Optional[float]]:
-    """Reward function that checks if the completion is the same as the ground truth."""
-    contents = [completion[0]["content"] for completion in completions]
-    rewards = []
-    for content, sol in zip(contents, solution):
-        gold_parsed = parse(
-            sol,
-            extraction_mode="first_match",
+import re
+from typing import List, Dict, Optional, Tuple, Any
+
+# Assumed available from your env:
+# parse, verify, LatexExtractionConfig, NormalizationConfig
+
+# ---------- Helpers ----------
+
+_TUPLE_RE = re.compile(
+    r"""
+    ^\s*
+    \(?
+      \s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))   # x
+      \s*,\s*
+      ([+-]?(?:\d+(?:\.\d+)?|\.\d+))      # y
+    \s*\)?
+    \s*$
+    """,
+    re.VERBOSE,
+)
+
+_NUMBER_RE = re.compile(r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)")
+
+def _build_extraction_cfg():
+    # Keep this identical for gold and answer
+    return [
+        LatexExtractionConfig(
+            normalization_config=NormalizationConfig(
+                nits=False,
+                malformed_operators=False,
+                basic_latex=True,   # accept x^2, \frac, etc.
+                equations=False,    # allow bare expressions (no '=' required)
+                boxed="all",
+                units=True,         # tolerate \text{cm}, etc.
+            ),
+            boxed_match_priority=0,
+            try_extract_without_anchor=True,  # allow plain expressions
         )
-        if len(gold_parsed) != 0:
-            # We require the answer to be provided in correct latex (no malformed operators)
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed="all",
-                            units=True,
-                        ),
-                        # Ensures that boxed is tried first
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
-            # Compute binary rewards if verifiable, `None` otherwise to skip this example
+    ]
+
+def _strip_think(text: str) -> str:
+    # Remove <think> ... </think> blocks and typical fenced code
+    text = re.sub(r"<think>.*?</think>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    return text
+
+def _normalize_units(text: str) -> str:
+    """
+    Convert malformed unit patterns like `7{inch}` -> `7 \text{inch}` (LaTeXish),
+    but also keep a pure-numeric candidate around later.
+    """
+    # 12{inch} or 12{cm} -> 12 \text{inch}
+    text = re.sub(r"(\d)\s*\{([A-Za-z]+)\}", r"\1 \\text{\2}", text)
+    return text
+
+def _maybe_wrap_boxed(s: str) -> str:
+    """If it's a bare math-ish expression, wrap to nudge the extractor."""
+    t = s.strip()
+    if not t or r"\boxed" in t or "$" in t or r"\(" in t or r"\[" in t:
+        return s
+    # contains only typical math tokens?
+    if re.fullmatch(r"[-+*/^0-9xX().,\sA-Za-z]+", t):
+        return rf"\boxed{{{t}}}"
+    return s
+
+def _extract_anchored_answer(text: str) -> Optional[str]:
+    """
+    Try common anchors in LLM outputs to pull a concise answer string.
+    Returns the captured answer WITHOUT trailing punctuation.
+    """
+    patterns = [
+        r"ANSWER\s*:\s*(.+)$",
+        r"Final\s+Answer\s*:\s*(.+)$",
+        r"The\s+final\s+answer\s+is\s*:\s*(.+)$",
+        r"Therefore[, ]+the\s+answer\s+is\s*[:\-]?\s*(.+)$",
+        r"Thus[, ]+the\s+answer\s+is\s*[:\-]?\s*(.+)$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE | re.MULTILINE)
+        if m:
+            ans = m.group(1).strip()
+            # remove trailing sentence enders
+            ans = re.sub(r"[.\s]+$", "", ans)
+            return ans
+    return None
+
+def _parse_tuple(s: str) -> Optional[Tuple[float, float]]:
+    m = _TUPLE_RE.match(s.strip())
+    if not m:
+        return None
+    return (float(m.group(1)), float(m.group(2)))
+
+def _tuple_equal(a: str, b: str, tol: float = 1e-9) -> Optional[bool]:
+    ta = _parse_tuple(a)
+    tb = _parse_tuple(b)
+    if ta is None or tb is None:
+        return None
+    return (abs(ta[0]-tb[0]) <= tol) and (abs(ta[1]-tb[1]) <= tol)
+
+def _sympy_equal(a: str, b: str) -> Optional[bool]:
+    """Optional symbolic equivalence for expressions/polynomials."""
+    try:
+        from sympy import sympify, Eq
+    except Exception:
+        return None
+    aa = a.replace("^", "**").strip()
+    bb = b.replace("^", "**").strip()
+    try:
+        return bool(Eq(sympify(aa), sympify(bb)))
+    except Exception:
+        return None
+
+def _last_number(text: str) -> Optional[str]:
+    nums = list(_NUMBER_RE.finditer(text))
+    return nums[-1].group(0) if nums else None
+
+def _first_boxed(text: str) -> Optional[str]:
+    m = re.search(r"\\boxed\s*\{([^}]*)\}", text)
+    return m.group(1).strip() if m else None
+
+# ---------- Main reward ----------
+
+def accuracy_reward(
+    completions: List[List[Dict[str, str]]],
+    solution: List[str],
+    **kwargs
+) -> List[Optional[float]]:
+    """
+    Binary reward:
+      - 1.0 if the model's answer matches the gold.
+      - 0.0 if verifiably wrong.
+      - None if unverifiable (skip).
+    Strategy:
+      1) Clean & normalize text (strip <think>, fix units).
+      2) Try to extract an anchored or boxed answer string from the completion.
+      3) Run structured parse/verify with identical config for gold & answer.
+      4) Fallbacks: tuple compare; SymPy equivalence; final numeric token match.
+    """
+    extraction_cfg = _build_extraction_cfg()
+
+    rewards: List[Optional[float]] = []
+    for completion, gold in zip(completions, solution):
+        raw = completion[0]["content"]
+
+        # --- sanitize/normalize ---
+        content = _normalize_units(_strip_think(raw))
+        # Prefer an anchored/boxed snippet if present; else keep whole content
+        candidate = (
+            _extract_anchored_answer(content)
+            or _first_boxed(content)
+            or content
+        )
+
+        # Also prepare boxed-boosted sources for the parser
+        gold_src = _maybe_wrap_boxed(gold)
+        ans_src  = _maybe_wrap_boxed(candidate)
+
+        # --- primary: structured parse + verify ---
+        gold_parsed = parse(gold_src, extraction_config=extraction_cfg, extraction_mode="first_match")
+        if gold_parsed:
+            answer_parsed = parse(ans_src, extraction_config=extraction_cfg, extraction_mode="first_match")
             try:
                 reward = float(verify(gold_parsed, answer_parsed))
+                rewards.append(reward)
+                continue
             except Exception as e:
-                print(f"verify failed: {e}, answer: {answer_parsed}, gold: {gold_parsed}")
-                reward = None
-        else:
-            # If the gold solution is not parseable, we assign `None` to skip this example
-            reward = None
-            print("Failed to parse gold solution: ", sol)
-        rewards.append(reward)
+                print(f"[verify failed] {e}\n answer: {answer_parsed}\n gold: {gold_parsed}")
+
+        # --- fallback A: exact tuple equality (common in geometry/coords) ---
+        t_eq = _tuple_equal(gold, candidate)
+        if t_eq is True:
+            rewards.append(1.0); continue
+        if t_eq is False:
+            rewards.append(0.0); continue
+
+        # --- fallback B: symbolic equivalence (polynomials/expressions) ---
+        s_eq = _sympy_equal(gold, candidate)
+        if s_eq is True:
+            rewards.append(1.0); continue
+        if s_eq is False:
+            rewards.append(0.0); continue
+
+        # --- fallback C: match last numeric token if gold is numeric ---
+        # (Useful when answer is "The width is 7 feet" and gold is "7")
+        if _NUMBER_RE.fullmatch(gold.strip()):
+            last_num = _last_number(candidate)
+            if last_num is not None:
+                rewards.append(1.0 if last_num == gold.strip() else 0.0)
+                continue
+
+        # Could not verify; skip this item
+        print("Failed to parse/verify example.\nGold:", gold, "\nCandidate:", candidate)
+        rewards.append(None)
 
     return rewards
+
 
 
 def format_reward(completions, **kwargs):
