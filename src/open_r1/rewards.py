@@ -37,200 +37,222 @@ from .utils.competitive_programming import score_submission as cf_score_submissi
 from .utils.competitive_programming import score_subtask
 
 
+# rewards.py
 import re
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple
 
-# Assumed available from your env:
-# parse, verify, LatexExtractionConfig, NormalizationConfig
+try:
+    from sympy import sympify, Eq
+    _HAS_SYMPY = True
+except Exception:
+    _HAS_SYMPY = False
 
-# ---------- Helpers ----------
+_TAGS_RE = re.compile(r"<think>.*?</think>|```.*?```|</?\w+>", re.DOTALL | re.IGNORECASE)
+WS_RE = re.compile(r"\s+")
+def _clean(s: str) -> str:
+    s = str(s or "")
+    s = _TAGS_RE.sub(" ", s)
+    s = s.replace(r"\left","").replace(r"\right","")
+    s = s.replace(r"\,"," ").replace(r"\!","")   # kill thinspace/!
+    s = s.replace("\u00a0"," ")
+    return WS_RE.sub(" ", s).strip()
 
-_TUPLE_RE = re.compile(
-    r"""
-    ^\s*
-    \(?
-      \s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))   # x
-      \s*,\s*
-      ([+-]?(?:\d+(?:\.\d+)?|\.\d+))      # y
-    \s*\)?
-    \s*$
-    """,
-    re.VERBOSE,
-)
+def _unbox(s: str) -> str:
+    m = re.search(r"(?:\\)?boxed\s*\{([^}]*)\}", s)
+    return m.group(1).strip() if m else s
 
-_NUMBER_RE = re.compile(r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)")
-
-def _build_extraction_cfg():
-    # Keep this identical for gold and answer
-    return [
-        LatexExtractionConfig(
-            normalization_config=NormalizationConfig(
-                nits=False,
-                malformed_operators=False,
-                basic_latex=True,   # accept x^2, \frac, etc.
-                equations=False,    # allow bare expressions (no '=' required)
-                boxed="all",
-                units=True,         # tolerate \text{cm}, etc.
-            ),
-            boxed_match_priority=0,
-            try_extract_without_anchor=True,  # allow plain expressions
-        )
-    ]
-
-def _strip_think(text: str) -> str:
-    # Remove <think> ... </think> blocks and typical fenced code
-    text = re.sub(r"<think>.*?</think>", " ", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
-    return text
-
-def _normalize_units(text: str) -> str:
-    """
-    Convert malformed unit patterns like `7{inch}` -> `7 \text{inch}` (LaTeXish),
-    but also keep a pure-numeric candidate around later.
-    """
-    # 12{inch} or 12{cm} -> 12 \text{inch}
-    text = re.sub(r"(\d)\s*\{([A-Za-z]+)\}", r"\1 \\text{\2}", text)
-    return text
-
-def _maybe_wrap_boxed(s: str) -> str:
-    """If it's a bare math-ish expression, wrap to nudge the extractor."""
+NUM_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
+def _to_float(s: str) -> Optional[float]:
     t = s.strip()
-    if not t or r"\boxed" in t or "$" in t or r"\(" in t or r"\[" in t:
-        return s
-    # contains only typical math tokens?
-    if re.fullmatch(r"[-+*/^0-9xX().,\sA-Za-z]+", t):
-        return rf"\boxed{{{t}}}"
-    return s
+    if not t: return None
+    if _HAS_SYMPY:
+        try: return float(sympify(t.replace("^","**")))
+        except Exception: pass
+    m = NUM_RE.search(t)
+    return float(m.group(0)) if m else None
 
-def _extract_anchored_answer(text: str) -> Optional[str]:
-    """
-    Try common anchors in LLM outputs to pull a concise answer string.
-    Returns the captured answer WITHOUT trailing punctuation.
-    """
-    patterns = [
-        r"ANSWER\s*:\s*(.+)$",
-        r"Final\s+Answer\s*:\s*(.+)$",
-        r"The\s+final\s+answer\s+is\s*:\s*(.+)$",
-        r"Therefore[, ]+the\s+answer\s+is\s*[:\-]?\s*(.+)$",
-        r"Thus[, ]+the\s+answer\s+is\s*[:\-]?\s*(.+)$",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, flags=re.IGNORECASE | re.MULTILINE)
-        if m:
-            ans = m.group(1).strip()
-            # remove trailing sentence enders
-            ans = re.sub(r"[.\s]+$", "", ans)
-            return ans
+def _strip_thousands(s: str) -> str:
+    return re.sub(r"(?<=\d),(?=\d{3}\b)", "", s)
+
+# intervals
+INTERVAL_RE = re.compile(r"(?P<l>[\(\[])\s*(?P<a>-?\s*(?:\\infty|∞|inf|[0-9]+(?:\.[0-9]+)?))\s*,\s*(?P<b>[+\-]?\s*(?:\\infty|∞|\+?inf|[0-9]+(?:\.[0-9]+)?))\s*(?P<r>[\)\]])")
+def _is_interval(s: str) -> bool: return bool(INTERVAL_RE.search(s))
+def _norm_inf(tok: str) -> Optional[float]:
+    t = tok.replace(" ","").lower()
+    if any(k in t for k in [r"\\infty","∞","inf"]): return None
+    try: return float(t)
+    except: return None
+def _parse_interval(s: str) -> Optional[Tuple[Optional[float], Optional[float], bool, bool]]:
+    m = INTERVAL_RE.search(s)
+    if not m: return None
+    l, a, b, r = m.group("l","a","b","r")
+    return (_norm_inf(a), _norm_inf(b), l=="[", r=="]")
+
+# choice letter
+CHOICE_TEXT_RE = re.compile(r"\\text\s*\{\s*\(([A-Za-z])\)\s*\}$")
+def _as_choice_letter(s: str) -> Optional[str]:
+    s = s.strip()
+    m = CHOICE_TEXT_RE.match(s)
+    if m: return m.group(1).upper()
+    s2 = _unbox(s)
+    m2 = re.match(r"^\(?\s*([A-Za-z])\s*\)?$", s2)
+    if m2: return m2.group(1).upper()
+    if len(s2)==1 and s2.isalpha(): return s2.upper()
     return None
 
-def _parse_tuple(s: str) -> Optional[Tuple[float, float]]:
-    m = _TUPLE_RE.match(s.strip())
-    if not m:
-        return None
-    return (float(m.group(1)), float(m.group(2)))
+# ratio
+RATIO_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)\s*:\s*([+-]?\d+(?:\.\d+)?)\s*$")
+def _as_ratio(s: str) -> Optional[Tuple[float,float]]:
+    m = RATIO_RE.match(s.strip())
+    return (float(m.group(1)), float(m.group(2))) if m else None
 
-def _tuple_equal(a: str, b: str, tol: float = 1e-9) -> Optional[bool]:
-    ta = _parse_tuple(a)
-    tb = _parse_tuple(b)
-    if ta is None or tb is None:
-        return None
-    return (abs(ta[0]-tb[0]) <= tol) and (abs(ta[1]-tb[1]) <= tol)
+# fraction/sqrt
+FRAC_RE = re.compile(r"\\c?frac\s*\{\s*([^}]*)\s*\}\s*\{\s*([^}]*)\s*\}")
+SQRT_RE = re.compile(r"\\sqrt\s*\{\s*([^}]*)\s*\}")
+def _value_of_frac_or_expr(s: str) -> Optional[float]:
+    s2 = _unbox(s)
+    m = FRAC_RE.search(s2)
+    if m:
+        num, den = m.group(1).strip(), m.group(2).strip()
+        if _HAS_SYMPY:
+            try: return float(sympify(f"({num})/({den})".replace("^","**")))
+            except Exception: pass
+        try: return float(num)/float(den)
+        except Exception: pass
+    if _HAS_SYMPY:
+        try: return float(sympify(s2.replace("^","**")))
+        except Exception: pass
+    return None
 
-def _sympy_equal(a: str, b: str) -> Optional[bool]:
-    """Optional symbolic equivalence for expressions/polynomials."""
+# base digits like 10001_2 or "10001 (base 2)"
+BASE_RE = re.compile(r"^\s*([0-9A-Za-z]+)\s*_(\d+)\s*$")
+BASE_PAREN_RE = re.compile(r"^\s*([0-9A-Za-z]+)\s*\(base\s*(\d+)\)\s*$", re.IGNORECASE)
+def _as_base_value(s: str) -> Optional[Tuple[str,int]]:
+    s2 = _unbox(_clean(s))
+    m = BASE_RE.match(s2)
+    if m: return (m.group(1), int(m.group(2)))
+    m2 = BASE_PAREN_RE.match(s2)
+    if m2: return (m2.group(1), int(m2.group(2)))
+    return None
+
+# 3x1 vector
+PMAT_RE = re.compile(r"\\begin\{pmatrix\}(.*?)\\end\{pmatrix\}", re.DOTALL)
+def _as_vector3(s: str) -> Optional[Tuple[float,float,float]]:
+    s2 = _unbox(s)
+    m = PMAT_RE.search(s2)
+    if not m: return None
+    parts = [p.strip() for p in m.group(1).split(r"\\") if p.strip()]
+    if len(parts)!=3: return None
     try:
-        from sympy import sympify, Eq
+        vals = []
+        for p in parts:
+            if _HAS_SYMPY: vals.append(float(sympify(p.replace("^","**"))))
+            else:
+                nm = NUM_RE.search(p)
+                if not nm: return None
+                vals.append(float(nm.group(0)))
+        return tuple(vals)
     except Exception:
         return None
-    aa = a.replace("^", "**").strip()
-    bb = b.replace("^", "**").strip()
-    try:
-        return bool(Eq(sympify(aa), sympify(bb)))
-    except Exception:
-        return None
 
-def _last_number(text: str) -> Optional[str]:
-    nums = list(_NUMBER_RE.finditer(text))
-    return nums[-1].group(0) if nums else None
-
-def _first_boxed(text: str) -> Optional[str]:
-    m = re.search(r"\\boxed\s*\{([^}]*)\}", text)
-    return m.group(1).strip() if m else None
-
-# ---------- Main reward ----------
+def _gold_type(gold: str) -> str:
+    g = _clean(gold)
+    if _is_interval(g): return "INTERVAL"
+    if _as_ratio(g): return "RATIO"
+    if _as_choice_letter(g): return "CHOICE"
+    if _as_base_value(g): return "BASE"
+    if _as_vector3(g): return "VEC3"
+    if FRAC_RE.search(g) or SQRT_RE.search(g): return "EXPR"
+    if re.fullmatch(r"[+-]?\d+(?:,\d{3})*(?:\.\d+)?", g): return "NUM_WITH_COMMAS"
+    if NUM_RE.fullmatch(g): return "NUMBER"
+    return "GENERIC"
 
 def accuracy_reward(
     completions: List[List[Dict[str, str]]],
     solution: List[str],
     **kwargs
 ) -> List[Optional[float]]:
-    """
-    Binary reward:
-      - 1.0 if the model's answer matches the gold.
-      - 0.0 if verifiably wrong.
-      - None if unverifiable (skip).
-    Strategy:
-      1) Clean & normalize text (strip <think>, fix units).
-      2) Try to extract an anchored or boxed answer string from the completion.
-      3) Run structured parse/verify with identical config for gold & answer.
-      4) Fallbacks: tuple compare; SymPy equivalence; final numeric token match.
-    """
-    extraction_cfg = _build_extraction_cfg()
-
     rewards: List[Optional[float]] = []
-    for completion, gold in zip(completions, solution):
-        raw = completion[0]["content"]
+    for completion, gold_raw in zip(completions, solution):
+        cand_raw = completion[0].get("content","")
+        gold = _clean(gold_raw)
+        cand = _clean(cand_raw)
+        cand_core = _unbox(cand)
+        gtype = _gold_type(gold)
 
-        # --- sanitize/normalize ---
-        content = _normalize_units(_strip_think(raw))
-        # Prefer an anchored/boxed snippet if present; else keep whole content
-        candidate = (
-            _extract_anchored_answer(content)
-            or _first_boxed(content)
-            or content
-        )
+        # INTERVAL
+        if gtype == "INTERVAL":
+            g = _parse_interval(gold)
+            c = _parse_interval(cand_core) or _parse_interval(cand)
+            rewards.append(1.0 if (g and c and g==c) else 0.0 if c else None)
+            continue
 
-        # Also prepare boxed-boosted sources for the parser
-        gold_src = _maybe_wrap_boxed(gold)
-        ans_src  = _maybe_wrap_boxed(candidate)
+        # RATIO
+        if gtype == "RATIO":
+            g = _as_ratio(gold)
+            c = _as_ratio(cand_core) or _as_ratio(cand)
+            rewards.append(1.0 if (g and c and abs(g[0]-c[0])<=1e-9 and abs(g[1]-c[1])<=1e-9)
+                           else 0.0 if c else None)
+            continue
 
-        # --- primary: structured parse + verify ---
-        gold_parsed = parse(gold_src, extraction_config=extraction_cfg, extraction_mode="first_match")
-        if gold_parsed:
-            answer_parsed = parse(ans_src, extraction_config=extraction_cfg, extraction_mode="first_match")
+        # CHOICE
+        if gtype == "CHOICE":
+            g = _as_choice_letter(gold)
+            c = _as_choice_letter(cand_core) or _as_choice_letter(cand)
+            rewards.append(1.0 if (g and c and g==c) else 0.0 if c else None)
+            continue
+
+        # BASE
+        if gtype == "BASE":
+            gdigits, gbase = _as_base_value(gold)
+            cp = _as_base_value(cand_core) or _as_base_value(cand)
+            if cp:
+                rewards.append(1.0 if (gdigits.lower()==cp[0].lower() and gbase==cp[1]) else 0.0)
+            else:
+                only_digits = re.fullmatch(r"[0-9A-Za-z]+", cand_core)
+                rewards.append(0.0 if only_digits else None)
+            continue
+
+        # VEC3
+        if gtype == "VEC3":
+            g = _as_vector3(gold)
+            c = _as_vector3(cand_core) or _as_vector3(cand)
+            rewards.append(1.0 if (g and c and all(abs(gi-ci)<=1e-9 for gi,ci in zip(g,c)))
+                           else 0.0 if c else None)
+            continue
+
+        # NUMERIC / EXPR
+        if gtype in ("NUM_WITH_COMMAS","NUMBER","EXPR"):
+            g_str = _strip_thousands(gold)
+            g_val = None
+            if gtype == "EXPR":
+                g_val = _value_of_frac_or_expr(g_str)
+            if g_val is None:
+                try: g_val = float(g_str)
+                except: g_val = _to_float(g_str)
+
+            c_val = _value_of_frac_or_expr(cand_core)
+            if c_val is None:
+                c_val = _to_float(_strip_thousands(cand_core))
+            if c_val is None:
+                c_val = _to_float(_strip_thousands(cand))
+            rewards.append(1.0 if (g_val is not None and c_val is not None and abs(g_val-c_val)<=1e-9)
+                           else 0.0 if (c_val is not None) else None)
+            continue
+
+        # GENERIC fallback
+        if _HAS_SYMPY:
             try:
-                reward = float(verify(gold_parsed, answer_parsed))
-                rewards.append(reward)
+                eq = bool(Eq(sympify(gold.replace("^","**")), sympify(cand_core.replace("^","**"))))
+                rewards.append(1.0 if eq else 0.0)
                 continue
-            except Exception as e:
-                print(f"[verify failed] {e}\n answer: {answer_parsed}\n gold: {gold_parsed}")
+            except Exception:
+                pass
 
-        # --- fallback A: exact tuple equality (common in geometry/coords) ---
-        t_eq = _tuple_equal(gold, candidate)
-        if t_eq is True:
-            rewards.append(1.0); continue
-        if t_eq is False:
-            rewards.append(0.0); continue
-
-        # --- fallback B: symbolic equivalence (polynomials/expressions) ---
-        s_eq = _sympy_equal(gold, candidate)
-        if s_eq is True:
-            rewards.append(1.0); continue
-        if s_eq is False:
-            rewards.append(0.0); continue
-
-        # --- fallback C: match last numeric token if gold is numeric ---
-        # (Useful when answer is "The width is 7 feet" and gold is "7")
-        if _NUMBER_RE.fullmatch(gold.strip()):
-            last_num = _last_number(candidate)
-            if last_num is not None:
-                rewards.append(1.0 if last_num == gold.strip() else 0.0)
-                continue
-
-        # Could not verify; skip this item
-        print("Failed to parse/verify example.\nGold:", gold, "\nCandidate:", candidate)
-        rewards.append(None)
-
+        g_last = _to_float(gold)
+        c_last = _to_float(cand_core) or _to_float(cand)
+        rewards.append(1.0 if (g_last is not None and c_last is not None and abs(g_last-c_last)<=1e-9)
+                       else 0.0 if c_last is not None else None)
     return rewards
 
 

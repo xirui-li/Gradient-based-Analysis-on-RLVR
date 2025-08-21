@@ -355,27 +355,6 @@ class GRPOTrainerWithShapely(GRPOTrainer):
         
         self._eval_batch_size = self.args.eval_batch_size
 
-        # ---- Shapley logging policy (minimal) ---------------------------------
-        self._shapley_log_every = 1  # log cadence
-        # Collect all trainable param names once
-        _all_param_names = [n for n, p in self.model.named_parameters() if p.requires_grad]
-
-        # Sample exactly once, deterministically from seed; make it identical on all ranks
-        rng = np.random.default_rng(getattr(self.args, "seed", 0) or 0)
-
-        if self.accelerator.is_main_process:
-            k = min(512, len(_all_param_names))
-            sampled = rng.choice(_all_param_names, size=k, replace=False).tolist()
-        else:
-            sampled = None
-
-        # Broadcast the sampled set to all processes so everyone filters by the same names
-        sampled = broadcast_object_list([sampled], from_process=0)[0]
-        self._shapley_param_sample = set(sampled)
-        # -----------------------------------------------------------------------
-
-
-
     def get_eval_dataloader(self, eval_dataset=None) -> DataLoader:
         """
         Returns the training [`~torch.utils.data.DataLoader`].
@@ -1021,7 +1000,7 @@ class GRPOTrainerWithShapely(GRPOTrainer):
                 eval_gradients = torch.autograd.grad(
                     scaled_loss,
                     model.parameters(),
-                    retain_graph=True,
+                    retain_graph=False,
                     create_graph=False
                 )
         else:
@@ -1029,12 +1008,19 @@ class GRPOTrainerWithShapely(GRPOTrainer):
             eval_gradients = torch.autograd.grad(
                 eval_loss_for_grad,
                 model.parameters(),
-                retain_graph=True,
+                retain_graph=False,
                 create_graph=False
             )
+        
+        del eval_loss
+        torch.cuda.empty_cache()
 
         # Compute Shapley value as dot product of gradients
         self.compute_shapley_from_gradients(train_gradients, eval_gradients, model)
+
+        del train_gradients
+        del eval_gradients
+        torch.cuda.empty_cache()
 
         # Now perform the actual backward pass for training (following original training_step logic)
         if self.use_apex:

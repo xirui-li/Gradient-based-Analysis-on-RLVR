@@ -17,11 +17,11 @@ bf16: true
 use_vllm: true
 do_eval: true
 eval_strategy: steps
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 4
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: Qwen2.5-1.5B-Instruct-GRPO-Math12k-no-thinkng
+hub_model_id: Qwen2.5-1.5B-Instruct-GRPO-Math12k-thinking
 hub_strategy: every_save
 learning_rate: 1.0e-06
 log_completions: true

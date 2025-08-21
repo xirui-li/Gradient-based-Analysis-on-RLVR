@@ -3,8 +3,8 @@
 #SBATCH --partition=scavenger
 #SBATCH --account=scavenger
 #SBATCH --qos=scavenger
-#SBATCH --nodelist=vulcan35
-#SBATCH --gres=gpu:rtxa5000:4
+#SBATCH --nodelist=tron50
+#SBATCH --gres=gpu:rtxa6000:2
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
@@ -14,13 +14,12 @@
 # Load conda manually
 # Load appropriate modules
 # source /nfshomes/xiruili/anaconda3/etc/profile.d/conda.sh
-# conda activate gradient-analysis
+# conda activate /fs/cml-projects/gradient/envs/gradient
 
 # Environment variables
 export WANDB_API_KEY="7b8ef784250fec92ca3bf5f34c5c04834b9ec7c4" 
 export WANDB_PROJECT="huggingface"
 export WANDB_NAME="Qwen2.5-Math-1.5B-GRPO-gsm8k"
-export CUDA_VISIBLE_DEVICES=5,6
 
 # Launch training
 ACCELERATE_LOG_LEVEL=info \
