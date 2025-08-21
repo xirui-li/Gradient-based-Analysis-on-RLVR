@@ -329,3 +329,9 @@ class GRPOScriptArguments(ScriptArguments):
         default=4096,
         metadata={"help": "Minimum number of characters in completion."},
     )
+    eval_dataset_name: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Name of the evaluation dataset. If not provided, the training dataset will be used for evaluation."
+        },
+    )

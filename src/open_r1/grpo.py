@@ -110,6 +110,54 @@ def main(script_args, training_args, model_args):
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
 
+    ####################################
+    # Set the shapely evaluation dataset
+    ####################################
+    eval_dataset = dataset[script_args.dataset_test_split]
+
+    if script_args.eval_dataset_name is not None:
+        if "gsm8k" in script_args.eval_dataset_name:
+            
+            eval_dataset = dataset[script_args.dataset_test_split]
+
+        elif "MATH-500" in script_args.eval_dataset_name:
+
+            eval_dataset_hf = datasets.load_dataset(script_args.eval_dataset_name, split="test")
+
+            eval_dataset_hf = eval_dataset_hf.shuffle(seed=training_args.seed)
+
+            # Format into {prompt, solution} with your make_conversation
+            eval_dataset_hf = eval_dataset_hf.map(
+                make_conversation,
+                fn_kwargs={"prompt_column": "problem"},  # always use "question"
+                desc="Formatting MATH-500 eval to {prompt, solution}"
+            )
+
+            if "messages" in eval_dataset_hf.column_names:
+                eval_dataset_hf = eval_dataset_hf.remove_columns("messages")
+
+            # Make sure order matches old eval (["prompt", "solution"])
+            eval_dataset_hf = eval_dataset_hf.select_columns(eval_dataset.column_names)
+
+            # Replace both dataset dict and eval_dataset reference
+            eval_dataset = eval_dataset_hf
+
+        elif "GPQA-Diamond" in script_args.eval_dataset_name:
+
+            eval_dataset_hf = datasets.load_dataset(script_args.eval_dataset_name, split="test")
+
+            eval_dataset_hf = eval_dataset_hf.shuffle(seed=training_args.seed)
+
+            # Format into {prompt, solution}
+            eval_dataset_hf = eval_dataset_hf.map(make_conversation, fn_kwargs={"prompt_column": "question"}, desc="GPQA→{prompt, solution}").select_columns(["prompt", "solution"])
+
+            if "messages" in eval_dataset_hf.column_names:
+                eval_dataset_hf = eval_dataset_hf.remove_columns("messages")
+
+            eval_dataset_hf = eval_dataset_hf.select_columns(["prompt", "solution"])
+
+            # Use only the local variable (do NOT mutate `dataset`)
+            eval_dataset = eval_dataset_hf
     #############################
     # Initialize the GRPO trainer
     #############################
@@ -120,7 +168,7 @@ def main(script_args, training_args, model_args):
             reward_funcs=reward_funcs,
             args=training_args,
             train_dataset=dataset[script_args.dataset_train_split],
-            eval_dataset=(dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None),
+            eval_dataset=(eval_dataset if training_args.eval_strategy != "no" else None),
             peft_config=get_peft_config(model_args),
             callbacks=get_callbacks(training_args, model_args),
             processing_class=tokenizer,
