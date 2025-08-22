@@ -783,26 +783,6 @@ class GRPOTrainer(Trainer):
                         reward_func, evaluation_mode=True, device_placement=True
                     )
 
-        # ---- Shapley logging policy (minimal) ---------------------------------
-        self._shapley_log_every = 1  # log cadence
-        # Collect all trainable param names once
-        _all_param_names = [n for n, p in self.model.named_parameters() if p.requires_grad]
-
-        # Sample exactly once, deterministically from seed; make it identical on all ranks
-        rng = np.random.default_rng(getattr(self.args, "seed", 0) or 0)
-
-        if self.accelerator.is_main_process:
-            k = min(512, len(_all_param_names))
-            sampled = rng.choice(_all_param_names, size=k, replace=False).tolist()
-        else:
-            sampled = None
-
-        # Broadcast the sampled set to all processes so everyone filters by the same names
-        sampled = broadcast_object_list([sampled], from_process=0)[0]
-        self._shapley_param_sample = set(sampled)
-        self._grad_param_sample = getattr(self, "_shapley_param_sample", None)
-        self._grad_log_every = getattr(self, "_shapley_log_every", 500)
-        # ----------------------------------------------------------------------
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -1668,9 +1648,6 @@ class GRPOTrainer(Trainer):
         if not self.accelerator.is_main_process:
             return
         step = int(getattr(self.state, "global_step", 0))
-        log_every = int(getattr(self, "_grad_log_every", 500)) or 500
-        if step != 0 and (step % log_every) != 0:
-            return
 
         grad_items = [(name, grad) for name, grad in gradients.items() if grad is not None]
 
@@ -1686,14 +1663,8 @@ class GRPOTrainer(Trainer):
             self._running_layer_norms = defaultdict(list)
             self._topk_svd_layers = None
             self._svd_top_k = 5  # You can make this a config arg
-        
-        sample = getattr(self, "_grad_param_sample", None)
-        if sample is None or len(sample) == 0:
-            return
 
         for name, grad in grad_items:
-            if name not in sample:
-                continue
             if grad is None:
                 continue
 

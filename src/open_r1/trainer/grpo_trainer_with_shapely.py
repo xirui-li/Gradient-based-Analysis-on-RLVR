@@ -1015,8 +1015,9 @@ class GRPOTrainerWithShapely(GRPOTrainer):
         del eval_loss
         torch.cuda.empty_cache()
 
+        mode = "train" if self.model.training else "eval"
         # Compute Shapley value as dot product of gradients
-        self.compute_shapley_from_gradients(train_gradients, eval_gradients, model)
+        self.compute_shapley_from_gradients(train_gradients, eval_gradients, model, mode=mode)
 
         del train_gradients
         del eval_gradients
@@ -1037,7 +1038,6 @@ class GRPOTrainerWithShapely(GRPOTrainer):
             
             # Extract gradients and collect stats (following original training_step)
             gradients = self._extract_global_gradients(self.accelerator, self.model)
-            mode = "train" if self.model.training else "eval"
             self._collect_gradient_stats_by_layers(gradients, mode)
             self._save_all_metrics_snapshot(
                     mode=mode
@@ -1045,48 +1045,77 @@ class GRPOTrainerWithShapely(GRPOTrainer):
 
         return train_loss.detach()
 
-    def compute_shapley_from_gradients(self,
-                                    train_gradients_tuple,
-                                    eval_gradients_tuple,
-                                    model,
-                                    mode: str = "train") -> None:
-        """
-        Compute and log per-layer Shapley values as dot products between train and eval gradients.
-
-        Args:
-            train_gradients_tuple: Tuple of training gradients from torch.autograd.grad()
-            eval_gradients_tuple: Tuple of evaluation gradients from torch.autograd.grad()
-            model: The model to get parameter names from
-            mode: Logging namespace (e.g., "shapley") for tracking
-        """
-        # --- rank-0 only logging ---
+    def compute_shapley_from_gradients(
+            self,
+            train_gradients,  # tuple of gradients from torch.autograd.grad
+            eval_gradients,   # tuple of gradients from torch.autograd.grad
+            model,
+            mode=None,  # "train" or "eval"
+        ) -> None:
+        """Compute Shapley values as dot product of train and eval gradients."""
         if not self.accelerator.is_main_process:
             return
 
-        # --- throttle by global step ---
-        step = int(getattr(self.state, "global_step", 0))
-        if step % getattr(self, "_shapley_log_every", 500) != 0:
+        if mode is None:
+            mode = "train" if model.training else "eval"
+
+        # Get parameter names to match with gradients
+        param_names = [name for name, _ in model.named_parameters()]
+        
+        # Ensure we have matching lengths
+        if len(param_names) != len(train_gradients) or len(param_names) != len(eval_gradients):
+            print(f"[rank0] Warning: Parameter count mismatch - names: {len(param_names)}, "
+                f"train_grads: {len(train_gradients)}, eval_grads: {len(eval_gradients)}")
             return
 
-        step_shapley_stats = {}
-
-        # Convert gradient tuples to named dictionaries and compute dot products
-        for (name, param), train_grad, eval_grad in zip(model.named_parameters(), train_gradients_tuple, eval_gradients_tuple):
-            if train_grad is None or eval_grad is None:
+        # Setup metrics storage
+        metrics_mode = self._metrics.setdefault(mode, defaultdict(list))
+        
+        # Compute Shapley values
+        step = int(getattr(self.state, "global_step", 0))
+        shapley_values = []
+        computed_params = []
+        
+        for name, g_train, g_eval in zip(param_names, train_gradients, eval_gradients):
+            if g_train is None or g_eval is None:
                 continue
-            if name not in self._shapley_param_sample:
-                continue
-
+                
             try:
-                dot = torch.dot(train_grad.flatten(), eval_grad.flatten()).item()
+                # Ensure same device and dtype
+                if g_train.device != g_eval.device:
+                    g_eval = g_eval.to(g_train.device)
+                if g_train.dtype != g_eval.dtype:
+                    g_eval = g_eval.to(g_train.dtype)
+                    
+                # Compute dot product (Shapley value)
+                shapley_value = torch.dot(g_train.flatten(), g_eval.flatten()).item()
+                
+                # Store the value
+                metrics_mode[f"shapley_stats/params/{name}/dot_product"].append(float(shapley_value))
+                shapley_values.append(shapley_value)
+                computed_params.append(name)
+                
             except RuntimeError as e:
-                print(f"[Warning] Dot product failed for {name}: {e}")
-                dot = None
+                if self.args.debug:
+                    print(f"Failed to compute Shapley for {name}: {str(e)}")
+                continue
+        
+        # Compute and log aggregate statistics
+        if shapley_values:
+            shapley_tensor = torch.tensor(shapley_values)
+            metrics_mode["shapley_stats/aggregate/mean"].append(float(shapley_tensor.mean()))
+            metrics_mode["shapley_stats/aggregate/std"].append(float(shapley_tensor.std()))
+            metrics_mode["shapley_stats/aggregate/max"].append(float(shapley_tensor.max()))
+            metrics_mode["shapley_stats/aggregate/min"].append(float(shapley_tensor.min()))
+            metrics_mode["shapley_stats/aggregate/num_params"].append(len(shapley_values))
+            
+            if self.args.debug:
+                print(f"[rank0] Step {step}: Computed {len(shapley_values)}/{len(param_names)} "
+                    f"Shapley values, mean={shapley_tensor.mean():.6f}, std={shapley_tensor.std():.6f}")
+        else:
+            print(f"[rank0] No Shapley values computed at step {step} "
+                f"(total parameters: {len(param_names)})")
 
-            if dot is not None:
-                param_prefix = f"shapley_stats/params/{name}"
-                self._metrics[mode][f"{param_prefix}/dot_product"].append(dot)
-                step_shapley_stats[f"{param_prefix}/dot_product"] = dot
 
     @profiling_decorator
     def _prepare_inputs(
