@@ -1797,25 +1797,29 @@ class GRPOTrainer(Trainer):
 
     def _save_all_metrics_snapshot(self, mode: str):
         """
-        Gather per-rank metrics at the current step and save one JSON line per rank to a JSONL file from rank 0.
+        Save one file per step:
+        stats/{run_name}/step_{step:08d}/metrics.json
 
-        Each line structure:
+        File schema:
         {
-            "mode": "train",
-            "step": 100,
-            "rank": 0,
-            "metrics": {...}
+        "mode": "...",
+        "step": <int>,
+        "world_size": <int>,
+        "entries": [
+            {"mode": "...", "step": ..., "rank": 0, "metrics": {...}},
+            {"mode": "...", "step": ..., "rank": 1, "metrics": {...}},
+            ...
+        ]
         }
         """
-
-        save_dir = f"stats/{self.run_name}"
-        os.makedirs(save_dir, exist_ok=True)
-        filepath = os.path.join(save_dir, f"{mode}_metrics.jsonl")
+        import os, json, torch, torch.distributed as dist
+        import numpy as np
 
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
-
         step = self.state.global_step
+
+        # Local payload (ensure JSON-serializable)
         local_entry = {
             "mode": mode,
             "step": step,
@@ -1823,39 +1827,46 @@ class GRPOTrainer(Trainer):
             "metrics": self._recursive_convert(self._metrics.get(mode, {})),
         }
 
-        # Serialize and convert to bytes
-        local_json = json.dumps(local_entry)
-        local_bytes = torch.tensor(list(local_json.encode("utf-8")), dtype=torch.uint8, device="cuda")
+        # ---- gather variable-length bytes ----
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        arr = np.frombuffer(json.dumps(local_entry).encode("utf-8"), dtype=np.uint8)
+        local_bytes = torch.from_numpy(arr).to(dev)
 
-        # Share sizes
-        local_size = torch.tensor([local_bytes.numel()], dtype=torch.int64, device="cuda")
-        all_sizes = [torch.zeros(1, dtype=torch.int64, device="cuda") for _ in range(world_size)]
-        dist.all_gather(all_sizes, local_size)
+        local_size = torch.tensor([local_bytes.numel()], dtype=torch.int64, device=dev)
+        if world_size > 1 and dist.is_initialized():
+            # share sizes
+            all_sizes = [torch.zeros(1, dtype=torch.int64, device=dev) for _ in range(world_size)]
+            dist.all_gather(all_sizes, local_size)
 
-        max_size = max(size.item() for size in all_sizes)
-        padded = torch.zeros(max_size, dtype=torch.uint8, device="cuda")
-        padded[:local_bytes.numel()] = local_bytes
+            max_size = int(max(s.item() for s in all_sizes))
+            padded = torch.zeros(max_size, dtype=torch.uint8, device=dev)
+            padded[: local_bytes.numel()] = local_bytes
 
-        gathered = [torch.zeros(max_size, dtype=torch.uint8, device="cuda") for _ in range(world_size)]
-        dist.all_gather(gathered, padded)
+            gathered = [torch.zeros(max_size, dtype=torch.uint8, device=dev) for _ in range(world_size)]
+            dist.all_gather(gathered, padded)
+        else:
+            all_sizes = [local_size]
+            gathered = [local_bytes]
 
-        # Append to file (rank 0 only)
+        # ---- rank 0 writes per-step file (no 'mode' in path) ----
         if rank == 0:
-            with open(filepath, "a") as f:
-                for tensor, size in zip(gathered, all_sizes):
-                    try:
-                        raw_bytes = tensor[:size.item()].cpu().numpy().tobytes()
-                        line = raw_bytes.decode("utf-8")
-                        f.write(line + "\n")
-                    except Exception as e:
-                        print(f"[Rank 0] Failed to write metrics: {e}")
+            save_root = os.path.join("stats", self.run_name, f"step_{step:08d}")
+            os.makedirs(save_root, exist_ok=True)
+            out_path = os.path.join(save_root, "metrics.json")
 
+            entries = []
+            for tensor, size in zip(gathered, all_sizes):
+                try:
+                    raw = tensor[: int(size.item())].detach().to("cpu").numpy().tobytes()
+                    entries.append(json.loads(raw.decode("utf-8")))
+                except Exception as e:
+                    print(f"[Rank 0] Failed to decode gathered metrics: {e}")
 
-
-
-
-
-
-
-
-
+            blob = {
+                "mode": mode,
+                "step": int(step),
+                "world_size": int(world_size),
+                "entries": entries,
+            }
+            with open(out_path, "w") as f:
+                json.dump(blob, f, indent=2)

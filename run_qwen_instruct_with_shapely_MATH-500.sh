@@ -21,8 +21,6 @@ export WANDB_API_KEY="7b8ef784250fec92ca3bf5f34c5c04834b9ec7c4"
 export WANDB_PROJECT="huggingface"
 export WANDB_NAME="Qwen2.5-Math-1.5B-GRPO-gsm8k"
 
-export CUDA_VISIBLE_DEVICES=5,6
-
 # Launch training
 ACCELERATE_LOG_LEVEL=info \
 accelerate launch --config_file recipes/accelerate_configs/zero3_debug.yaml \
