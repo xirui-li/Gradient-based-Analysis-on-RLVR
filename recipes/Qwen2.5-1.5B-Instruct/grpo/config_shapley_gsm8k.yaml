@@ -17,6 +17,7 @@ bf16: true
 use_vllm: true
 do_eval: true
 eval_strategy: steps
+eval_dataset_name: openai/gsm8k
 gradient_accumulation_steps: 8
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:

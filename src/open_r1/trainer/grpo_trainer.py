@@ -1702,7 +1702,7 @@ class GRPOTrainer(Trainer):
         # Compute SVD on selected layers every 50 steps
         if self._topk_svd_layers and self.state.global_step % 50 == 0:
             for name, grad in grad_items:
-                if name not in self._topk_svd_layers or grad.ndim < 2 or name not in sample:
+                if name not in self._topk_svd_layers or grad.ndim < 2:
                     continue
 
                 try:
