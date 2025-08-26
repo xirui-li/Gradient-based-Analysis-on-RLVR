@@ -184,3 +184,8 @@ results/
 *.jpg
 *.jpeg
 *.json
+
+stats/
+plots/
+plots_1/
+plots_2/
