@@ -253,6 +253,8 @@ def accuracy_reward(
         c_last = _to_float(cand_core) or _to_float(cand)
         rewards.append(1.0 if (g_last is not None and c_last is not None and abs(g_last-c_last)<=1e-9)
                        else 0.0 if c_last is not None else None)
+    # replace None with 0.0
+    rewards = [r if r is not None else 0.0 for r in rewards]
     return rewards
 
 

@@ -1052,6 +1052,8 @@ class GRPOTrainerWithShapely(GRPOTrainer):
             model,
             mode=None,  # "train" or "eval"
         ) -> None:
+        use_cosine_similarity = True
+
         """Compute Shapley values as dot product of train and eval gradients."""
         if not self.accelerator.is_main_process:
             return
@@ -1088,7 +1090,14 @@ class GRPOTrainerWithShapely(GRPOTrainer):
                     g_eval = g_eval.to(g_train.dtype)
                     
                 # Compute dot product (Shapley value)
-                shapley_value = torch.dot(g_train.flatten(), g_eval.flatten()).item()
+                if use_cosine_similarity:
+                    gt = g_train.flatten()
+                    ge = g_eval.flatten()
+                    denom = (gt.norm() * ge.norm()).clamp_min(1e-12)
+                    shapley_value = torch.dot(gt, ge) / denom
+                    shapley_value = shapley_value.item()
+                else:
+                    shapley_value = torch.dot(g_train.flatten(), g_eval.flatten()).item()
                 
                 # Store the value
                 metrics_mode[f"shapley_stats/params/{name}/dot_product"].append(float(shapley_value))
@@ -1418,6 +1427,56 @@ class GRPOTrainerWithShapely(GRPOTrainer):
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
 
+        # H ≈ mean_t( - log πθ(y_t | y_<t, x) ) over completion tokens (masked after first EOS)
+        # We compute per-token log-probs for the completion positions, then average -logp.
+        with torch.no_grad():
+            # If already computed above, reuse it; otherwise compute now.
+            if old_per_token_logps is not None:
+                per_token_logps = old_per_token_logps  # shape: (B, C)
+            else:
+                per_token_logps = self._get_per_token_logps(
+                    self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+                )  # shape: (B, C)
+
+        # Mask: count only tokens up to & including the first EOS (and possibly drop truncated completions)
+        # completion_mask: (B, C) with {0,1}
+        mask = completion_mask.to(per_token_logps.dtype)
+
+        # Monte-Carlo entropy per token: -log p(y_t)
+        nll = -per_token_logps  # (B, C)
+
+        # Global (all tokens across batch) entropy mean
+        total_nll = (nll * mask).sum()
+        total_tokens = mask.sum().clamp_min(1)
+        entropy_mc_mean = (total_nll / total_tokens).item()
+
+        # Per-sequence entropy (mean over tokens of that sequence)
+        per_seq_tokens = mask.sum(dim=1).clamp_min(1)
+        per_seq_entropy = (nll * mask).sum(dim=1) / per_seq_tokens  # (B,)
+
+        # Gather to main process for logging consistent with other metrics
+        agg_per_seq_entropy = self.accelerator.gather(per_seq_entropy)
+        self._metrics[mode]["entropy/per_seq_mean"].append(agg_per_seq_entropy.float().mean().item())
+        self._metrics[mode]["entropy/per_seq_min"].append(agg_per_seq_entropy.float().min().item())
+        self._metrics[mode]["entropy/per_seq_max"].append(agg_per_seq_entropy.float().max().item())
+
+        # Also log mean over all tokens (global)
+        self._metrics[mode]["entropy/mc_token_nll_mean"].append(entropy_mc_mean)
+
+        # (Optional) Restrict to sequences that terminated with EOS
+        agg_is_terminated = self.accelerator.gather(is_eos.any(dim=1))  # (B_total,)
+        if agg_is_terminated.any():
+            term_mask_local = is_eos.any(dim=1)  # (B,)
+            if term_mask_local.any():
+                term_nll = (nll[term_mask_local] * mask[term_mask_local]).sum()
+                term_tokens = mask[term_mask_local].sum().clamp_min(1)
+                term_entropy_mc_mean = (term_nll / term_tokens).item()
+                self._metrics[mode]["entropy/mc_token_nll_mean_terminated"].append(term_entropy_mc_mean)
+            else:
+                # Keep metric aligned in case of no terminated seq on this rank
+                self._metrics[mode]["entropy/mc_token_nll_mean_terminated"].append(float("nan"))
+        else:
+            self._metrics[mode]["entropy/mc_token_nll_mean_terminated"].append(float("nan"))
         # Log the metrics
         if mode == "train":
             self.state.num_input_tokens_seen += self.accelerator.gather(attention_mask.sum()).sum().item()

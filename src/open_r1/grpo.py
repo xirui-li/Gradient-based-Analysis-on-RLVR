@@ -89,20 +89,37 @@ def main(script_args, training_args, model_args):
     reward_funcs = get_reward_funcs(script_args)
 
     # Format into conversation
-    def make_conversation(example, prompt_column: str = script_args.dataset_prompt_column):
-        prompt = []
+    if 'math' in script_args.dataset_name.lower():
+        def make_conversation(example, prompt_column: str = script_args.dataset_prompt_column):
+            prompt = []
 
-        # if training_args.system_prompt is not None:
-            # prompt.append({"role": "system", "content": training_args.system_prompt})
+            # if training_args.system_prompt is not None:
+                # prompt.append({"role": "system", "content": training_args.system_prompt})
 
-        if prompt_column not in example:
-            raise ValueError(f"Dataset Question Field Error: {prompt_column} is not supported.")
-        if training_args.system_prompt is not None:
-            prompt_suffix = training_args.system_prompt
-        else:
-            prompt_suffix = ""
-        prompt.append({"role": "user", "content": example[prompt_column] + " " + prompt_suffix})
-        return {"prompt": prompt, "solution": example["answer"]}
+            if prompt_column not in example:
+                raise ValueError(f"Dataset Question Field Error: {prompt_column} is not supported.")
+            if training_args.system_prompt is not None:
+                prompt_suffix = training_args.system_prompt
+            else:
+                prompt_suffix = ""
+            prompt.append({"role": "user", "content": example[prompt_column] + " " + prompt_suffix})
+            return {"prompt": prompt, "solution": example["answer"]}
+    elif 'gsm8k' in script_args.dataset_name.lower():
+        def make_conversation(example, prompt_column: str = script_args.dataset_prompt_column):
+            prompt = []
+
+            # if training_args.system_prompt is not None:
+                # prompt.append({"role": "system", "content": training_args.system_prompt})
+
+            if prompt_column not in example:
+                raise ValueError(f"Dataset Question Field Error: {prompt_column} is not supported.")
+            if training_args.system_prompt is not None:
+                prompt_suffix = training_args.system_prompt
+            else:
+                prompt_suffix = ""
+            prompt.append({"role": "user", "content": example[prompt_column] + " " + prompt_suffix})
+            answer = example["answer"].split("#### ")[-1].strip()
+            return {"prompt": prompt, "solution": answer}
 
     dataset = dataset.map(make_conversation)
 
