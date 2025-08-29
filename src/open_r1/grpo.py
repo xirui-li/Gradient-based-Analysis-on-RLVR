@@ -27,7 +27,7 @@ from open_r1.utils import get_dataset, get_model, get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import ModelConfig, TrlParser, get_peft_config
-from open_r1.trainer import GRPOTrainer, GRPOTrainerWithShapely
+from open_r1.trainer import GRPOTrainer, GRPOTrainerWithShapely, GRPOTrainerWithNewReward 
 
 
 logger = logging.getLogger(__name__)
@@ -178,7 +178,8 @@ def main(script_args, training_args, model_args):
     #############################
     # Initialize the GRPO trainer
     #############################
-    shapely = True
+    shapely = False
+    new_reward = True
     if shapely:
         trainer = GRPOTrainerWithShapely(
             model=model,
@@ -186,6 +187,17 @@ def main(script_args, training_args, model_args):
             args=training_args,
             train_dataset=dataset[script_args.dataset_train_split],
             eval_dataset=(eval_dataset if training_args.eval_strategy != "no" else None),
+            peft_config=get_peft_config(model_args),
+            callbacks=get_callbacks(training_args, model_args),
+            processing_class=tokenizer,
+        )
+    elif new_reward:
+        trainer = GRPOTrainerWithNewReward(
+            model=model,
+            reward_funcs=reward_funcs,
+            args=training_args,
+            train_dataset=dataset[script_args.dataset_train_split],
+            eval_dataset=(dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None),
             peft_config=get_peft_config(model_args),
             callbacks=get_callbacks(training_args, model_args),
             processing_class=tokenizer,
