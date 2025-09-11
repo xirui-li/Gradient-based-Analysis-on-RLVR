@@ -22,11 +22,11 @@ export WANDB_PROJECT="huggingface"
 export WANDB_NAME="Qwen2.5-Math-1.5B-GRPO-Thinking"
 export CUDA_VISIBLE_DEVICES=0,1
 
-export TRITON_CACHE_DIR=/fs/cml-projects/gradient/triton_cache
-mkdir -p $TRITON_CACHE_DIR
+# export TRITON_CACHE_DIR=/fs/cml-projects/gradient/triton_cache
+# mkdir -p $TRITON_CACHE_DIR
 
 # Launch training
 ACCELERATE_LOG_LEVEL=info \
-accelerate launch --config_file recipes/accelerate_configs/zero3.yaml \
+accelerate launch --config_file recipes/accelerate_configs/zero3_debug.yaml \
     src/open_r1/grpo.py --config recipes/Qwen2.5-1.5B-Instruct/grpo/config_gsm8k.yaml \
     --vllm_mode colocate

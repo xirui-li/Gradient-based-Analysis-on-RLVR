@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import os
 import textwrap
 import warnings
@@ -1625,118 +1624,305 @@ class GRPOTrainer(Trainer):
 
             if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
                 kwargs["scale_wrt_gas"] = False
-
+            print("Loss before backward:", loss.item())
             self.accelerator.backward(loss, **kwargs)
-            gradients = self._extract_global_gradients(self.accelerator, self.model)
+            # gradients = self._extract_global_gradients(self.accelerator, self.model)
             mode = "train" if self.model.training else "eval"
-            self._collect_gradient_stats_by_layers(gradients, mode)
+            # self._collect_gradient_stats_by_layers(gradients, mode)
             self._save_all_metrics_snapshot(
-                    step=self.state.global_step,
                     mode=mode
                 )
 
 
             return loss.detach()
 
+    # def _collect_gradient_stats_by_layers(self, gradients, mode):
+    #     """
+    #     Collect gradient statistics and optionally compute SVD-derived metrics
+    #     (nuclear norm and effective rank) for top-k layers based on average Frobenius norm.
+
+    #     Runs SVD only every 50 steps after determining top-k layers during early training.
+    #     """
+    #     if not self.accelerator.is_main_process:
+    #         return
+    #     step = int(getattr(self.state, "global_step", 0))
+
+    #     grad_items = [(name, grad) for name, grad in gradients.items() if grad is not None]
+
+    #     if not grad_items:
+    #         print(f"Debug: No gradients found on rank {self.accelerator.process_index}. This is expected under ZeRO-3.")
+    #         return
+
+    #     step_grad_stats = {}
+
+    #     # Initialize stateful containers
+    #     if not hasattr(self, "_running_layer_norms"):
+    #         from collections import defaultdict
+    #         self._running_layer_norms = defaultdict(list)
+    #         self._topk_svd_layers = None
+    #         self._svd_top_k = 10000  # You can make this a config arg
+
+    #     for name, grad in grad_items:
+    #         if grad is None:
+    #             continue
+
+    #         # Basic stats
+    #         M_mean = grad.mean().item()
+    #         M_max = grad.max().item()
+    #         M_min = grad.min().item()
+    #         frobenius_norm = torch.linalg.norm(grad).item()
+
+    #         param_prefix = f"grad_stats/params/{name}"
+
+    #         # Save to memory
+    #         self._metrics[mode][f"{param_prefix}/M_mean"].append(M_mean)
+    #         self._metrics[mode][f"{param_prefix}/M_max"].append(M_max)
+    #         self._metrics[mode][f"{param_prefix}/M_min"].append(M_min)
+    #         self._metrics[mode][f"{param_prefix}/frobenius_norm"].append(frobenius_norm)
+
+    #         # Save to file
+    #         step_grad_stats[f"{param_prefix}/M_mean"] = M_mean
+    #         step_grad_stats[f"{param_prefix}/M_max"] = M_max
+    #         step_grad_stats[f"{param_prefix}/M_min"] = M_min
+    #         step_grad_stats[f"{param_prefix}/frobenius_norm"] = frobenius_norm
+
+    #         # Track norm for first 50 steps
+    #         if self.state.global_step < 50 and grad.ndim >= 2:
+    #             self._running_layer_norms[name].append(frobenius_norm)
+
+    #     # Select top-k layers at step 49
+    #     if self.state.global_step == 49:
+    #         avg_norms = {name: sum(vals) / len(vals) for name, vals in self._running_layer_norms.items()}
+    #         sorted_layers = sorted(avg_norms.items(), key=lambda x: x[1], reverse=True)
+    #         self._topk_svd_layers = {name for name, _ in sorted_layers[:self._svd_top_k]}
+    #         print(f"[Info] Top-{self._svd_top_k} layers selected for SVD:", self._topk_svd_layers)
+
+    #     # Compute SVD on selected layers every 50 steps
+    #     if self._topk_svd_layers and self.state.global_step % 50 == 0:
+    #         for name, grad in grad_items:
+    #             if name not in self._topk_svd_layers or grad.ndim < 2:
+    #                 continue
+
+    #             try:
+    #                 # GPU SVD for speed
+    #                 S = torch.linalg.svd(grad.detach(), full_matrices=False).S
+    #                 S_sum = S.sum().item()
+    #                 p = S / S_sum
+    #                 effective_rank = torch.exp(-torch.sum(p * torch.log(p + 1e-12))).item()
+
+    #                 nuclear_norm = S_sum
+    #                 S_max = S.max().item()
+    #                 S_min = S.min().item()
+
+    #                 # Save to memory
+    #                 param_prefix = f"grad_stats/params/{name}"
+    #                 self._metrics[mode][f"{param_prefix}/S_sum"].append(S_sum)
+    #                 self._metrics[mode][f"{param_prefix}/S_max"].append(S_max)
+    #                 self._metrics[mode][f"{param_prefix}/S_min"].append(S_min)
+    #                 self._metrics[mode][f"{param_prefix}/nuclear_norm"].append(nuclear_norm)
+    #                 self._metrics[mode][f"{param_prefix}/effective_rank"].append(effective_rank)
+
+    #                 # Save to JSONL
+    #                 step_grad_stats[f"{param_prefix}/S_sum"] = S_sum
+    #                 step_grad_stats[f"{param_prefix}/S_max"] = S_max
+    #                 step_grad_stats[f"{param_prefix}/S_min"] = S_min
+    #                 step_grad_stats[f"{param_prefix}/nuclear_norm"] = nuclear_norm
+    #                 step_grad_stats[f"{param_prefix}/effective_rank"] = effective_rank
+
+    #             except Exception as e:
+    #                 print(f"[Warning] SVD failed for {name} at step {self.state.global_step}: {e}")
+    #                 for stat in ["S_sum", "S_max", "S_min", "nuclear_norm", "effective_rank"]:
+    #                     self._metrics[mode][f"{param_prefix}/{stat}"].append(None)
+    #                     step_grad_stats[f"{param_prefix}/{stat}"] = None
+
     def _collect_gradient_stats_by_layers(self, gradients, mode):
         """
-        Collect gradient statistics and optionally compute SVD-derived metrics
-        (nuclear norm and effective rank) for top-k layers based on average Frobenius norm.
-
-        Runs SVD only every 50 steps after determining top-k layers during early training.
+        Enhanced gradient statistics collection for RLVR phenomena monitoring.
+        Computes SVD and phenomena metrics continuously for eligible layers.
         """
         if not self.accelerator.is_main_process:
             return
+        
         step = int(getattr(self.state, "global_step", 0))
-
         grad_items = [(name, grad) for name, grad in gradients.items() if grad is not None]
-
+        
         if not grad_items:
             print(f"Debug: No gradients found on rank {self.accelerator.process_index}. This is expected under ZeRO-3.")
             return
 
         step_grad_stats = {}
-
-        # Initialize stateful containers
-        if not hasattr(self, "_running_layer_norms"):
-            from collections import defaultdict
-            self._running_layer_norms = defaultdict(list)
-            self._topk_svd_layers = None
-            self._svd_top_k = 5  # You can make this a config arg
-
+        
+        # Initialize RLVR phenomena tracking
+        if not hasattr(self, "_gradient_history"):
+            from collections import deque
+            self._gradient_history = deque(maxlen=100)  # For aha moment detection
+            self._effective_rank_history = deque(maxlen=50)
+            self._gradient_diversity_history = deque(maxlen=50)
+            self._entropy_history = deque(maxlen=50)
+            self._last_gradients = None  # For temporal correlation
+            self._min_svd_params = 1000  # Minimum params for SVD computation
+            
+        # Collect all gradients for global analysis
+        all_grads = []
+        layer_effective_ranks = []
+        
         for name, grad in grad_items:
             if grad is None:
                 continue
-
-            # Basic stats
+                
+            flat_grad = grad.flatten()
+            all_grads.append(flat_grad)
+            
+            # Basic stats (always computed)
             M_mean = grad.mean().item()
             M_max = grad.max().item()
             M_min = grad.min().item()
             frobenius_norm = torch.linalg.norm(grad).item()
-
+            
             param_prefix = f"grad_stats/params/{name}"
-
-            # Save to memory
+            
+            # Save basic metrics
             self._metrics[mode][f"{param_prefix}/M_mean"].append(M_mean)
             self._metrics[mode][f"{param_prefix}/M_max"].append(M_max)
             self._metrics[mode][f"{param_prefix}/M_min"].append(M_min)
             self._metrics[mode][f"{param_prefix}/frobenius_norm"].append(frobenius_norm)
-
-            # Save to file
+            
             step_grad_stats[f"{param_prefix}/M_mean"] = M_mean
             step_grad_stats[f"{param_prefix}/M_max"] = M_max
             step_grad_stats[f"{param_prefix}/M_min"] = M_min
             step_grad_stats[f"{param_prefix}/frobenius_norm"] = frobenius_norm
-
-            # Track norm for first 50 steps
-            if self.state.global_step < 50 and grad.ndim >= 2:
-                self._running_layer_norms[name].append(frobenius_norm)
-
-        # Select top-k layers at step 49
-        if self.state.global_step == 49:
-            avg_norms = {name: sum(vals) / len(vals) for name, vals in self._running_layer_norms.items()}
-            sorted_layers = sorted(avg_norms.items(), key=lambda x: x[1], reverse=True)
-            self._topk_svd_layers = {name for name, _ in sorted_layers[:self._svd_top_k]}
-            print(f"[Info] Top-{self._svd_top_k} layers selected for SVD:", self._topk_svd_layers)
-
-        # Compute SVD on selected layers every 50 steps
-        if self._topk_svd_layers and self.state.global_step % 50 == 0:
-            for name, grad in grad_items:
-                if name not in self._topk_svd_layers or grad.ndim < 2:
-                    continue
-
+            
+            # Compute SVD for eligible layers (2D+ and large enough)
+            if grad.ndim >= 2 and grad.numel() >= self._min_svd_params and step % 10 == 0:
                 try:
-                    # GPU SVD for speed
                     S = torch.linalg.svd(grad.detach(), full_matrices=False).S
                     S_sum = S.sum().item()
-                    p = S / S_sum
+                    p = S / (S_sum + 1e-12)
                     effective_rank = torch.exp(-torch.sum(p * torch.log(p + 1e-12))).item()
-
+                    layer_effective_ranks.append(effective_rank)
+                    
+                    # SVD-derived metrics
                     nuclear_norm = S_sum
                     S_max = S.max().item()
                     S_min = S.min().item()
-
-                    # Save to memory
-                    param_prefix = f"grad_stats/params/{name}"
-                    self._metrics[mode][f"{param_prefix}/S_sum"].append(S_sum)
-                    self._metrics[mode][f"{param_prefix}/S_max"].append(S_max)
-                    self._metrics[mode][f"{param_prefix}/S_min"].append(S_min)
+                    condition_number = (S_max / (S_min + 1e-12))
+                    
+                    # Save SVD metrics
                     self._metrics[mode][f"{param_prefix}/nuclear_norm"].append(nuclear_norm)
                     self._metrics[mode][f"{param_prefix}/effective_rank"].append(effective_rank)
-
-                    # Save to JSONL
-                    step_grad_stats[f"{param_prefix}/S_sum"] = S_sum
-                    step_grad_stats[f"{param_prefix}/S_max"] = S_max
-                    step_grad_stats[f"{param_prefix}/S_min"] = S_min
+                    self._metrics[mode][f"{param_prefix}/condition_number"].append(condition_number)
+                    
                     step_grad_stats[f"{param_prefix}/nuclear_norm"] = nuclear_norm
                     step_grad_stats[f"{param_prefix}/effective_rank"] = effective_rank
-
+                    step_grad_stats[f"{param_prefix}/condition_number"] = condition_number
+                    
                 except Exception as e:
-                    print(f"[Warning] SVD failed for {name} at step {self.state.global_step}: {e}")
-                    for stat in ["S_sum", "S_max", "S_min", "nuclear_norm", "effective_rank"]:
-                        self._metrics[mode][f"{param_prefix}/{stat}"].append(None)
-                        step_grad_stats[f"{param_prefix}/{stat}"] = None
-
+                    print(f"[Warning] SVD failed for {name} at step {step}: {e}")
+        
+        # Global gradient analysis for RLVR phenomena
+        if all_grads:
+            global_grad = torch.cat(all_grads)
+            
+            # 1. Aha Moment Detection - Gradient Alignment
+            if self._last_gradients is not None:
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    global_grad.unsqueeze(0), 
+                    self._last_gradients.unsqueeze(0)
+                ).item()
+                
+                self._gradient_history.append(cos_sim)
+                step_grad_stats["phenomena/gradient_alignment"] = cos_sim
+                
+                # Detect sudden orthogonalization
+                if len(self._gradient_history) > 10:
+                    recent_avg = sum(list(self._gradient_history)[-10:]) / 10
+                    historical_avg = sum(list(self._gradient_history)[-50:]) / min(50, len(self._gradient_history))
+                    
+                    # Aha moment: sudden drop in alignment
+                    if cos_sim < recent_avg - 0.3 and cos_sim < historical_avg - 0.2:
+                        step_grad_stats["phenomena/aha_moment_detected"] = 1.0
+                    else:
+                        step_grad_stats["phenomena/aha_moment_detected"] = 0.0
+            
+            # 2. Overthinking - Gradient Entropy
+            abs_grad = global_grad.abs()
+            if abs_grad.sum() > 0:
+                p = abs_grad / abs_grad.sum()
+                entropy = -(p * torch.log(p + 1e-10)).sum().item()
+                self._entropy_history.append(entropy)
+                step_grad_stats["phenomena/gradient_entropy"] = entropy
+                
+                # Low entropy growth indicates overthinking
+                if len(self._entropy_history) > 20:
+                    recent_entropy = sum(list(self._entropy_history)[-10:]) / 10
+                    old_entropy = sum(list(self._entropy_history)[-20:-10]) / 10
+                    entropy_growth = (recent_entropy - old_entropy) / (old_entropy + 1e-8)
+                    step_grad_stats["phenomena/overthinking_score"] = max(0, -entropy_growth) 
+            
+            # 3. Global Effective Rank for Capability Collapse
+            if layer_effective_ranks:
+                mean_rank = sum(layer_effective_ranks) / len(layer_effective_ranks)
+                self._effective_rank_history.append(mean_rank)
+                step_grad_stats["phenomena/mean_effective_rank"] = mean_rank
+                
+                # Detect decreasing trend
+                if len(self._effective_rank_history) > 20:
+                    initial_rank = sum(list(self._effective_rank_history)[:10]) / 10
+                    recent_rank = sum(list(self._effective_rank_history)[-10:]) / 10
+                    rank_decline = (initial_rank - recent_rank) / (initial_rank + 1e-8)
+                    
+                    step_grad_stats["phenomena/capability_collapse_risk"] = max(0, rank_decline)
+            
+            # 4. Gradient Diversity for Entropy Collapse
+            grad_std = global_grad.std().item()
+            grad_mean = global_grad.mean().item()
+            cv = grad_std / (abs(grad_mean) + 1e-8)  # Coefficient of variation
+            
+            self._gradient_diversity_history.append(cv)
+            step_grad_stats["phenomena/gradient_diversity_cv"] = cv
+            
+            if len(self._gradient_diversity_history) > 10:
+                recent_cv = sum(list(self._gradient_diversity_history)[-10:]) / 10
+                if recent_cv < 0.1:  # Very low diversity
+                    step_grad_stats["phenomena/entropy_collapse_risk"] = 1.0
+                else:
+                    step_grad_stats["phenomena/entropy_collapse_risk"] = 0.0
+            
+            # 5. Reward Hacking - Gradient-Reward Decorrelation
+            if 'reward' in self._metrics.get(mode, {}):
+                recent_rewards = self._metrics[mode]['reward'][-10:] if len(self._metrics[mode]['reward']) > 10 else self._metrics[mode]['reward']
+                if recent_rewards and len(recent_rewards) > 1:
+                    reward_std = torch.tensor(recent_rewards).std().item()
+                    grad_norm = global_grad.norm().item()
+                    
+                    # Normalize both to [0,1] range for comparison
+                    if reward_std > 0:
+                        reward_signal = (recent_rewards[-1] - min(recent_rewards)) / reward_std
+                        grad_signal = grad_norm / (grad_norm + 1.0)  # Sigmoid-like normalization
+                        
+                        # Anomaly: high reward but low gradient activity
+                        if reward_signal > 2.0 and grad_signal < 0.1:
+                            step_grad_stats["phenomena/reward_hacking_signal"] = 1.0
+                        else:
+                            step_grad_stats["phenomena/reward_hacking_signal"] = 0.0
+            
+            self._last_gradients = global_grad.clone()
+        
+        # Add cross-layer statistics if we have multiple layers with SVD
+        if layer_effective_ranks and len(layer_effective_ranks) > 1:
+            rank_variance = torch.tensor(layer_effective_ranks).var().item()
+            rank_range = max(layer_effective_ranks) - min(layer_effective_ranks)
+            
+            step_grad_stats["phenomena/cross_layer_rank_variance"] = rank_variance
+            step_grad_stats["phenomena/cross_layer_rank_range"] = rank_range
+        
+        # Update metrics with all computed stats
+        for key, value in step_grad_stats.items():
+            if key not in self._metrics[mode]:
+                self._metrics[mode][key] = []
+            if not isinstance(self._metrics[mode][key], list):
+                self._metrics[mode][key] = [self._metrics[mode][key]]
+            self._metrics[mode][key].append(value)
 
     def _extract_global_gradients(self, accelerator, model):
         """

@@ -257,7 +257,65 @@ def accuracy_reward(
     rewards = [r if r is not None else 0.0 for r in rewards]
     return rewards
 
+def nuclear_norm_reward(completions, grad_signals=None, **kwargs):
+    """
+    Reward function that encourages LOWER nuclear norm (more sparse gradients).
+    Lower nuclear norm → higher reward.
+    Returns values in [0, 0.5] range.
+    """
+    if grad_signals is None:
+        # Return neutral reward if no gradient signals available
+        return [0.25] * len(completions)
+    
+    rewards = []
+    for signal in grad_signals:
+        if signal['n_layers_used'] == 0:
+            # No gradients computed, return neutral reward
+            rewards.append(0.25)
+        else:
+            # Nuclear norm is already normalized to [0, ~1] in your computation
+            # Lower nuclear norm is better, so we invert it
+            nuclear_score = signal['agg_nuclear']
+            
+            # Invert: lower nuclear norm → higher reward
+            # Map from [0, 1] to [0.5, 0] (inverted) 
+            reward = 0.5 * (1.0 - nuclear_score)
+            
+            # Ensure it's in [0, 0.5] range
+            reward = max(0.0, min(0.5, reward))
+            rewards.append(reward)
+    
+    return rewards
 
+
+def effective_rank_reward(completions, grad_signals=None, **kwargs):
+    """
+    Reward function that encourages HIGHER effective rank (more diverse gradients).
+    Higher effective rank → higher reward.
+    Returns values in [0, 0.5] range.
+    """
+    if grad_signals is None:
+        # Return neutral reward if no gradient signals available
+        return [0.25] * len(completions)
+    
+    rewards = []
+    for signal in grad_signals:
+        if signal['n_layers_used'] == 0:
+            # No gradients computed, return neutral reward
+            rewards.append(0.25)
+        else:
+            # Effective rank is already normalized to (0, 1] in your computation
+            # Higher effective rank is better, so we use it directly
+            erank_score = signal['agg_erank']
+            
+            # Map directly from [0, 1] to [0, 0.5]
+            reward = 0.5 * erank_score
+            
+            # Ensure it's in [0, 0.5] range
+            reward = max(0.0, min(0.5, reward))
+            rewards.append(reward)
+    
+    return rewards
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
@@ -829,6 +887,8 @@ def get_reward_funcs(script_args) -> list[Callable]:
     REWARD_FUNCS_REGISTRY = {
         "accuracy": accuracy_reward,
         "format": format_reward,
+        "nuclear_norm": nuclear_norm_reward,
+        "effective_rank": effective_rank_reward,
         "reasoning_steps": reasoning_steps_reward,
         "cosine": get_cosine_scaled_reward(
             min_value_wrong=script_args.cosine_min_value_wrong,
