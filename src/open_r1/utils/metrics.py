@@ -152,7 +152,7 @@ class MetricsComputer:
             "mode": training_mode,
             "loss": loss
         }
-        
+        print(f"Computing metrics at step {step}...")
         # Compute each metric based on its configuration
         for metric_name, metric_func in self.metric_functions.items():
             if self.should_compute_metric(metric_name, step):
@@ -203,10 +203,11 @@ class MetricsComputer:
         Computes gradient distribution metrics across layers.
         """
         metrics = {}
-        
+        print("Computing layer gradient distribution metrics...")
         # Group gradients by layer depth
         layer_groups = self._group_gradients_by_depth(gradients)
         
+        print(f"Found {len(layer_groups)} layer groups for gradient distribution analysis.")
         # Compute statistics per layer group
         layer_norms = {}
         layer_means = {}
@@ -268,6 +269,7 @@ class MetricsComputer:
         """
         Computes effective rank and related SVD metrics.
         """
+        print("Computing effective rank metrics...")
         metrics = {}
         layer_ranks = []
         layer_conditions = []
@@ -515,7 +517,7 @@ class MetricsComputer:
         """
         metrics = {}
         current_nuclear = {}
-        
+        print("Computing effective nuclear norm metrics...")
         # Group gradients by layer depth for cross-layer analysis
         layer_groups = self._group_gradients_by_depth(gradients)
         layer_nuclear_norms = {}

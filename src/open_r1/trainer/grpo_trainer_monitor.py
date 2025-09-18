@@ -1,4 +1,5 @@
 import os
+import random
 import textwrap
 import warnings
 from collections import defaultdict, deque
@@ -127,13 +128,7 @@ class GRPOTrainerMonitor(GRPOTrainer):
             "reasoning_emergence": {"enabled": False, "interval": 10},  # Enable if you have hidden states
             "global_gradient": {"enabled": False, "interval": 10}
         }
-        
-        # Create metrics computer
-        self.metrics_computer = MetricsComputer(
-            metric_config=metric_config,
-            svd_min_params=1000,
-            output_dir=f"metrics/{self.args.run_name}"  # or however you name your runs
-        )
+    
 
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], num_items_in_batch=None) -> torch.Tensor:
         """
@@ -188,22 +183,176 @@ class GRPOTrainerMonitor(GRPOTrainer):
                 kwargs["scale_wrt_gas"] = False
             self.accelerator.backward(loss, **kwargs)
            
-            # ============= METRICS COMPUTATION =============
-            # Only compute metrics on main process to avoid duplication
-            if self.accelerator.is_main_process:
-                # Extract gradients after backward pass
-                gradients = self._extract_global_gradients(self.accelerator, model)
-                mode = "train" if self.model.training else "eval"
-                # Compute metrics using our metrics computer
-                if gradients:  # Only if we successfully extracted gradients
-                    metrics = self.metrics_computer.compute_all_metrics(
-                        gradients=gradients,
-                        model=model,
-                        loss=loss.item(),
-                        rewards=rewards,
-                        hidden_states=hidden_states,
-                        training_mode=mode,
-                        step=self.state.global_step
-                    )
+            gradients = self._extract_global_gradients(self.accelerator, self.model)
+            mode = "train" if self.model.training else "eval"
+            self._collect_gradient_stats_by_layers(gradients, mode)
 
             return loss.detach()
+
+    def _collect_gradient_stats_by_layers(self, gradients, mode):
+        """
+        Collect gradient statistics with configurable intervals for different metrics.
+        """
+        if not self.accelerator.is_main_process:
+            return
+        step = int(getattr(self.state, "global_step", 0))
+
+        grad_items = [(name, grad) for name, grad in gradients.items() if grad is not None]
+
+        if not grad_items:
+            print(f"Debug: No gradients found on rank {self.accelerator.process_index}. This is expected under ZeRO-3.")
+            return
+
+        step_grad_stats = {}
+
+        # Initialize stateful containers and intervals
+        if not hasattr(self, "_svd_sample_layers"):
+            
+            # Configurable intervals
+            self._save_all_metrics_interval = 10  # save all metrics every 10 steps
+            self._basic_stats_interval = 10  # mean/max/min every 5 steps
+            self._nuclear_norm_interval = 10  # nuclear norm every 10 steps
+            self._effective_rank_interval = 10  # effective rank every 50 steps
+
+            self._svd_sample_size = -1
+            
+            # Fixed random sampling settings
+            eligible_layers = [name for name, grad in grad_items if grad.ndim >= 2]
+            if eligible_layers:
+                if self._svd_sample_size == -1:
+                    # Use all eligible layers
+                    self._svd_sample_layers = set(eligible_layers)
+                    print(f"[Init] Using all {len(eligible_layers)} eligible layers for SVD")
+                else:
+                    # Use fixed random sample
+                    random.seed(42)  # Fixed seed for reproducibility
+                    sample_size = min(self._svd_sample_size, len(eligible_layers))
+                    self._svd_sample_layers = set(random.sample(eligible_layers, sample_size))
+                    print(f"[Init] Fixed random sample of {sample_size} layers for SVD: {self._svd_sample_layers}")
+            else:
+                self._svd_sample_layers = set()
+
+        # Part 1: Basic statistics (mean, max, min, frobenius_norm)
+        if step % self._basic_stats_interval == 0:
+            for name, grad in grad_items:
+                if grad is None:
+                    continue
+
+                M_mean = grad.mean().item()
+                M_max = grad.max().item()
+                M_min = grad.min().item()
+                frobenius_norm = torch.linalg.norm(grad).item()
+
+                param_prefix = f"grad_stats/params/{name}"
+
+                # Save to file
+                step_grad_stats[f"{param_prefix}/M_mean"] = M_mean
+                step_grad_stats[f"{param_prefix}/M_max"] = M_max
+                step_grad_stats[f"{param_prefix}/M_min"] = M_min
+                step_grad_stats[f"{param_prefix}/frobenius_norm"] = frobenius_norm
+
+        # Randomly sample layers for SVD operations (when needed)
+        eligible_layers = [name for name, grad in grad_items if grad.ndim >= 2]
+        if eligible_layers and (step % self._nuclear_norm_interval == 0 or step % self._effective_rank_interval == 0):
+            sample_size = min(self._svd_sample_size, len(eligible_layers))
+            self._svd_sample_layers = set(random.sample(eligible_layers, sample_size))
+            print(f"[Step {step}] Randomly sampled {sample_size} layers for SVD: {self._svd_sample_layers}")
+
+        # Part 2: Nuclear norm calculation
+        if self._svd_sample_layers and step % self._nuclear_norm_interval == 0:
+            for name, grad in grad_items:
+                if name not in self._svd_sample_layers or grad.ndim < 2:
+                    continue
+
+                try:
+                    # Compute SVD for nuclear norm
+                    S = torch.linalg.svd(grad.detach(), full_matrices=False).S
+                    nuclear_norm = S.sum().item()
+                    S_max = S.max().item()
+                    S_min = S.min().item()
+
+                    param_prefix = f"grad_stats/params/{name}"
+
+                    step_grad_stats[f"{param_prefix}/nuclear_norm"] = nuclear_norm
+                    step_grad_stats[f"{param_prefix}/S_max"] = S_max
+                    step_grad_stats[f"{param_prefix}/S_min"] = S_min
+
+                except Exception as e:
+                    print(f"[Warning] SVD (nuclear norm) failed for {name} at step {step}: {e}")
+
+        # Part 3: Effective rank calculation
+        if self._svd_sample_layers and step % self._effective_rank_interval == 0:
+            for name, grad in grad_items:
+                if name not in self._svd_sample_layers or grad.ndim < 2:
+                    continue
+
+                try:
+                    # Compute SVD for effective rank
+                    S = torch.linalg.svd(grad.detach(), full_matrices=False).S
+                    S_sum = S.sum().item()
+                    p = S / S_sum
+                    effective_rank = torch.exp(-torch.sum(p * torch.log(p + 1e-12))).item()
+
+                    param_prefix = f"grad_stats/params/{name}"
+                    step_grad_stats[f"{param_prefix}/effective_rank"] = effective_rank
+
+                except Exception as e:
+                    print(f"[Warning] SVD (effective rank) failed for {name} at step {step}: {e}")
+
+        # Save summarized data if we collected any stats this step
+        if step_grad_stats and step % self._save_all_metrics_interval == 0:
+            self._save_summarized_metrics(step, mode, step_grad_stats)
+
+
+    def _extract_global_gradients(self, accelerator, model):
+        """
+        Extract full gradients under DeepSpeed ZeRO-3 using safe_get_full_grad.
+        """
+        unwrapped_model = accelerator.unwrap_model(model)
+        gradients = {}
+        for name, param in unwrapped_model.named_parameters():
+            if param.requires_grad:
+                full_grad = deepspeed.utils.safe_get_full_grad(param)
+                if full_grad is not None:
+                    gradients[name] = full_grad.clone()  # important: clone to avoid memory issues
+        return gradients
+
+
+    def _save_summarized_metrics(self, step: int, mode: str, step_grad_stats: dict):
+        """
+        Save only summarized gradient statistics data.
+        """
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        
+        # Only rank 0 saves
+        if rank == 0:
+            save_root = os.path.join("stats", self.run_name, f"step_{step:08d}")
+            os.makedirs(save_root, exist_ok=True)
+            out_path = os.path.join(save_root, "grad_summary.json")
+
+            summary = {
+                "mode": mode,
+                "step": int(step),
+                "metrics": step_grad_stats
+            }
+            
+            with open(out_path, "w") as f:
+                json.dump(summary, f, indent=2)
+
+
+    def _safe_convert(self, obj):
+        if isinstance(obj, (np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, torch.Tensor):
+            return obj.item()
+        return obj
+
+
+    def _recursive_convert(self, d):
+        if isinstance(d, dict):
+            return {k: self._recursive_convert(v) for k, v in d.items()}
+        elif isinstance(d, list):
+            return [self._safe_convert(v) for v in d]
+        else:
+            return self._safe_convert(d)
