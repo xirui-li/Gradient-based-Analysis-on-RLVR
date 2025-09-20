@@ -19,7 +19,7 @@
 # Environment variables
 export WANDB_API_KEY="7b8ef784250fec92ca3bf5f34c5c04834b9ec7c4" 
 export WANDB_PROJECT="huggingface"
-export WANDB_NAME="Qwen2.5-Math-1.5B-GRPO-GSM8k-Thinking-Random-Reward"
+export WANDB_NAME="Qwen2.5-Math-1.5B-GRPO-GSM8k-Thinking-No-Thinking"
 export CUDA_VISIBLE_DEVICES=0,1
 
 # export TRITON_CACHE_DIR=/fs/cml-projects/gradient/triton_cache
@@ -28,5 +28,5 @@ export CUDA_VISIBLE_DEVICES=0,1
 # Launch training
 ACCELERATE_LOG_LEVEL=info \
 accelerate launch --config_file recipes/accelerate_configs/zero3_debug.yaml \
-    src/open_r1/grpo.py --config recipes/Qwen2.5-1.5B-Instruct/grpo/config_gsm8k_monitor.yaml \
+    src/open_r1/grpo.py --config recipes/Qwen2.5-1.5B-Instruct/grpo/config_gsm8k_monitor_no_thinking.yaml \
     --vllm_mode colocate

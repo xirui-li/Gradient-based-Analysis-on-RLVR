@@ -146,7 +146,8 @@ class GRPOTrainerMonitor(GRPOTrainer):
 
         with self.compute_loss_context_manager():
             loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
-
+            print(f"Raw loss value: {loss.item()}")  # Add this debug line
+            print(f"Loss requires_grad: {loss.requires_grad}")
             # To be checked
             # Extract hidden states if your model outputs them (for reasoning emergence metrics)
             hidden_states = None
@@ -211,26 +212,30 @@ class GRPOTrainerMonitor(GRPOTrainer):
             # Configurable intervals
             self._save_all_metrics_interval = 10  # save all metrics every 10 steps
             self._basic_stats_interval = 10  # mean/max/min every 5 steps
-            self._nuclear_norm_interval = 10  # nuclear norm every 10 steps
-            self._effective_rank_interval = 10  # effective rank every 50 steps
+            self._svd_interval = 10  # nuclear norm and effective rank every 50 steps
 
-            self._svd_sample_size = -1
+            self._svd_sample_size = 50  # number of layers to sample for SVD calculations (-1 for all, 0 to disable)
             
-            # Fixed random sampling settings
+            # Select layers for SVD
             eligible_layers = [name for name, grad in grad_items if grad.ndim >= 2]
             if eligible_layers:
                 if self._svd_sample_size == -1:
                     # Use all eligible layers
                     self._svd_sample_layers = set(eligible_layers)
                     print(f"[Init] Using all {len(eligible_layers)} eligible layers for SVD")
-                else:
-                    # Use fixed random sample
+                elif self._svd_sample_size > 0:
+                    # Use fixed random sample (capped at number of eligible layers)
                     random.seed(42)  # Fixed seed for reproducibility
                     sample_size = min(self._svd_sample_size, len(eligible_layers))
                     self._svd_sample_layers = set(random.sample(eligible_layers, sample_size))
-                    print(f"[Init] Fixed random sample of {sample_size} layers for SVD: {self._svd_sample_layers}")
+                    print(f"[Init] Fixed random sample of {sample_size} layers for SVD (requested: {self._svd_sample_size}, available: {len(eligible_layers)})")
+                else:
+                    # Invalid sample size, disable SVD
+                    self._svd_sample_layers = set()
+                    print(f"[Init] Invalid SVD sample size: {self._svd_sample_size}. SVD calculations disabled.")
             else:
                 self._svd_sample_layers = set()
+                print(f"[Init] No eligible layers found for SVD (need grad.ndim >= 2)")
 
         # Part 1: Basic statistics (mean, max, min, frobenius_norm)
         if step % self._basic_stats_interval == 0:
@@ -251,15 +256,8 @@ class GRPOTrainerMonitor(GRPOTrainer):
                 step_grad_stats[f"{param_prefix}/M_min"] = M_min
                 step_grad_stats[f"{param_prefix}/frobenius_norm"] = frobenius_norm
 
-        # Randomly sample layers for SVD operations (when needed)
-        eligible_layers = [name for name, grad in grad_items if grad.ndim >= 2]
-        if eligible_layers and (step % self._nuclear_norm_interval == 0 or step % self._effective_rank_interval == 0):
-            sample_size = min(self._svd_sample_size, len(eligible_layers))
-            self._svd_sample_layers = set(random.sample(eligible_layers, sample_size))
-            print(f"[Step {step}] Randomly sampled {sample_size} layers for SVD: {self._svd_sample_layers}")
-
         # Part 2: Nuclear norm calculation
-        if self._svd_sample_layers and step % self._nuclear_norm_interval == 0:
+        if self._svd_sample_layers and step % self._svd_interval == 0:
             for name, grad in grad_items:
                 if name not in self._svd_sample_layers or grad.ndim < 2:
                     continue
@@ -277,18 +275,6 @@ class GRPOTrainerMonitor(GRPOTrainer):
                     step_grad_stats[f"{param_prefix}/S_max"] = S_max
                     step_grad_stats[f"{param_prefix}/S_min"] = S_min
 
-                except Exception as e:
-                    print(f"[Warning] SVD (nuclear norm) failed for {name} at step {step}: {e}")
-
-        # Part 3: Effective rank calculation
-        if self._svd_sample_layers and step % self._effective_rank_interval == 0:
-            for name, grad in grad_items:
-                if name not in self._svd_sample_layers or grad.ndim < 2:
-                    continue
-
-                try:
-                    # Compute SVD for effective rank
-                    S = torch.linalg.svd(grad.detach(), full_matrices=False).S
                     S_sum = S.sum().item()
                     p = S / S_sum
                     effective_rank = torch.exp(-torch.sum(p * torch.log(p + 1e-12))).item()
@@ -297,7 +283,7 @@ class GRPOTrainerMonitor(GRPOTrainer):
                     step_grad_stats[f"{param_prefix}/effective_rank"] = effective_rank
 
                 except Exception as e:
-                    print(f"[Warning] SVD (effective rank) failed for {name} at step {step}: {e}")
+                    print(f"[Warning] SVD (nuclear norm) failed for {name} at step {step}: {e}")
 
         # Save summarized data if we collected any stats this step
         if step_grad_stats and step % self._save_all_metrics_interval == 0:

@@ -18,6 +18,7 @@
 import asyncio
 import json
 import math
+import random
 import re
 from functools import partial, update_wrapper
 from typing import Callable, Dict, Literal, Optional
@@ -255,6 +256,8 @@ def accuracy_reward(
                        else 0.0 if c_last is not None else None)
     # replace None with 0.0
     rewards = [r if r is not None else 0.0 for r in rewards]
+    # reward = 1 50% of the time for suprious rewards
+    rewards = [random.randint(0, 1) for _ in range(len(rewards))]
     return rewards
 
 def nuclear_norm_reward(completions, grad_signals=None, **kwargs):
